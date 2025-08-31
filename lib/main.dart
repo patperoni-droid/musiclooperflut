@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -81,6 +83,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   String? mediaPath;
   bool isVideo = false;
 
+  // Session (prefs)
+  SharedPreferences? _prefs;
+  static const _kSessionKey = 'looptrainer_session_v1';
+  Timer? _autosaveTimer;
+
   // Players
   VideoPlayerController? _video;
   final _audio = AudioPlayer();
@@ -94,15 +101,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // Vitesse
   double speed = 1.0;
 
+  // ---------- cycle de vie ----------
+  @override
+  void initState() {
+    super.initState();
+    _initPrefsAndMaybeRestore();
+  }
+
+  Future<void> _initPrefsAndMaybeRestore() async {
+    _prefs = await SharedPreferences.getInstance();
+    await _restoreSession();  // recharge si possible
+    _startAutoSave();         // autosave toutes les 2 s
+  }
+
+  void _startAutoSave() {
+    _autosaveTimer?.cancel();
+    _autosaveTimer =
+        Timer.periodic(const Duration(seconds: 2), (_) => _saveSession());
+  }
+
   @override
   void dispose() {
     _video?.removeListener(_onVideoTick);
     _audioPosSub?.cancel();
+    _autosaveTimer?.cancel();
     _video?.dispose();
     _audio.dispose();
     super.dispose();
   }
 
+  // ---------- import / unload ----------
   Future<void> _pickFile() async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -142,6 +170,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         setState(() {}); // avance timeline
       });
     }
+
+    await _saveSession();
   }
 
   Future<void> _unload() async {
@@ -153,12 +183,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _video = null;
   }
 
+  // ---------- tick vidéo ----------
   void _onVideoTick() {
     if (!mounted) return;
     _checkLoopBoundaries();
     setState(() {}); // avance timeline
   }
 
+  // ---------- getters durée/position ----------
   Duration get _duration {
     if (isVideo) {
       final v = _video;
@@ -179,17 +211,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  // ---------- actions ----------
   Future<void> _seek(Duration pos) async {
     final d = _duration;
     if (d == Duration.zero) return;
-    final clamped =
-    pos < Duration.zero ? Duration.zero : (pos > d ? d : pos);
+    final clamped = pos < Duration.zero ? Duration.zero : (pos > d ? d : pos);
     if (isVideo) {
       await _video?.seekTo(clamped);
     } else {
       await _audio.seek(clamped);
     }
     setState(() {});
+    await _saveSession();
   }
 
   Future<void> _playPause() async {
@@ -210,6 +243,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
       setState(() {});
     }
+    // pas nécessaire de sauver ici, l'autosave suffit
   }
 
   Future<void> _setSpeed(double s) async {
@@ -219,9 +253,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } else {
       await _audio.setSpeed(s);
     }
+    await _saveSession();
   }
 
-  void _setA() => setState(() => a = _position);
+  void _setA() {
+    setState(() => a = _position);
+    _saveSession();
+  }
 
   void _setBQuick() {
     final pos = _position;
@@ -231,9 +269,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (a!.isNegative) a = Duration.zero;
       loopEnabled = true;
     });
+    _saveSession();
   }
 
-  void _toggleLoop() => setState(() => loopEnabled = !loopEnabled);
+  void _toggleLoop() {
+    setState(() => loopEnabled = !loopEnabled);
+    _saveSession();
+  }
 
   void _clearLoop() {
     setState(() {
@@ -241,6 +283,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       b = null;
       loopEnabled = false;
     });
+    _saveSession();
   }
 
   /// Vérifie les bornes A/B uniquement si la boucle est activée
@@ -254,6 +297,78 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  // ---------- sauvegarde / restauration ----------
+  Map<String, dynamic> _buildSession() {
+    return {
+      'mediaPath': mediaPath,
+      'isVideo': isVideo,
+      'speed': speed,
+      'a': a?.inMilliseconds,
+      'b': b?.inMilliseconds,
+      'loopEnabled': loopEnabled,
+      'position': _position.inMilliseconds,
+      'updatedAt': DateTime.now().millisecondsSinceEpoch,
+    };
+  }
+
+  Future<void> _saveSession() async {
+    if (_prefs == null) return;
+    if (mediaPath == null) return; // rien à sauver sans média
+    final jsonStr = jsonEncode(_buildSession());
+    await _prefs!.setString(_kSessionKey, jsonStr);
+  }
+
+  Future<void> _restoreSession() async {
+    if (_prefs == null) return;
+    final str = _prefs!.getString(_kSessionKey);
+    if (str == null) return;
+
+    final data = jsonDecode(str) as Map<String, dynamic>;
+    final path = data['mediaPath'] as String?;
+    if (path == null || !File(path).existsSync()) return; // fichier déplacé/supprimé ?
+
+    final wasVideo = (data['isVideo'] as bool?) ?? false;
+    final savedSpeed = (data['speed'] as num?)?.toDouble() ?? 1.0;
+    final aMs = data['a'] as int?;
+    final bMs = data['b'] as int?;
+    final loop = data['loopEnabled'] as bool? ?? false;
+    final posMs = data['position'] as int? ?? 0;
+
+    await _unload();
+
+    setState(() {
+      mediaPath = path;
+      isVideo = wasVideo;
+      speed = savedSpeed;
+      a = aMs != null ? Duration(milliseconds: aMs) : null;
+      b = bMs != null ? Duration(milliseconds: bMs) : null;
+      loopEnabled = loop;
+    });
+
+    if (isVideo) {
+      _video = VideoPlayerController.file(File(path));
+      await _video!.initialize();
+      await _video!.setLooping(false);
+      await _video!.setPlaybackSpeed(speed);
+      _video!.addListener(_onVideoTick);
+      setState(() {});
+    } else {
+      await _audio.setFilePath(path);
+      await _audio.setLoopMode(LoopMode.off);
+      await _audio.setSpeed(speed);
+      _audioPosSub = _audio.positionStream.listen((_) {
+        if (!mounted) return;
+        _checkLoopBoundaries();
+        setState(() {});
+      });
+    }
+
+    // seek à la position sauvegardée
+    final target = Duration(milliseconds: posMs);
+    await _seek(target);
+  }
+
+  // ---------- util ----------
   String _fmt(Duration d) {
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
@@ -438,12 +553,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 if (d == Duration.zero) return;
                 setState(() => a =
                     Duration(milliseconds: (d.inMilliseconds * ratio).round()));
+                _saveSession();
               },
               onDragB: (ratio) {
                 final d = _duration;
                 if (d == Duration.zero) return;
                 setState(() => b =
                     Duration(milliseconds: (d.inMilliseconds * ratio).round()));
+                _saveSession();
               },
             ),
           ),
