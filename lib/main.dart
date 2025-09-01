@@ -33,7 +33,7 @@ class LoopTrainerApp extends StatelessWidget {
   }
 }
 
-/// -------------------- NAV 3 onglets --------------------
+/// -------------------- NAV 4 onglets --------------------
 class HomeTabs extends StatefulWidget {
   const HomeTabs({super.key});
   @override
@@ -47,6 +47,7 @@ class _HomeTabsState extends State<HomeTabs> {
     PlayerScreen(),
     TunerScreen(),
     MetronomeScreen(),
+    SettingsScreen(), // <--- Réglages
   ];
 
   @override
@@ -65,6 +66,7 @@ class _HomeTabsState extends State<HomeTabs> {
           ),
           NavigationDestination(icon: Icon(Icons.tune), label: 'Accordeur'),
           NavigationDestination(icon: Icon(Icons.av_timer), label: 'Métronome'),
+          NavigationDestination(icon: Icon(Icons.settings), label: 'Réglages'),
         ],
       ),
     );
@@ -101,9 +103,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // Vitesse
   double speed = 1.0;
 
-  // Paramètres demandés
-  static const int _kDefaultGapMs = 4000;   // écart fixe entre A et B = 4 s
-  static const int _kZoomWindowMs = 12000;  // fenêtre zoom affichée = 12 s
+  // ---------- Getters réglages (prefs) ----------
+  // Fallback: 4000ms et 12000ms si rien en prefs.
+  int get _kDefaultGapMs {
+    final v = _prefs?.getInt('loopGapMs');
+    return (v == null || v <= 0) ? 4000 : v;
+  }
+
+  int get _kZoomWindowMs {
+    final v = _prefs?.getInt('zoomWindowMs');
+    return (v == null || v <= 0) ? 12000 : v;
+  }
 
   // ---------- cycle de vie ----------
   @override
@@ -259,7 +269,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await _saveSession();
   }
 
-  // ---------- fenêtre A/B auto : écart FIXE (4 s) ----------
+  // ---------- fenêtre A/B auto : écart FIXE autour du curseur ----------
   void _autoSetFixedGapAroundCursor() {
     final d = _duration;
     if (d == Duration.zero) return;
@@ -301,7 +311,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _saveSession();
   }
 
-  // B rapide → crée une fenêtre fixe (4 s) et active la boucle
+  // B rapide → crée une fenêtre fixe + active la boucle
   void _setBQuick() {
     _autoSetFixedGapAroundCursor();
     setState(() => loopEnabled = true);
@@ -414,7 +424,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return '$m:$s';
   }
 
-  // Fenêtre de zoom (12 s) centrée sur la boucle ou le curseur
+  // Fenêtre de zoom centrée sur la boucle ou le curseur
   (Duration, Duration) _zoomWindow() {
     final d = _duration;
     if (d == Duration.zero) return (Duration.zero, Duration.zero);
@@ -425,7 +435,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     int start = centerMs - _kZoomWindowMs ~/ 2;
     if (start < 0) start = 0;
-    if (start > totalMs - _kZoomWindowMs) start = (totalMs - _kZoomWindowMs).clamp(0, totalMs);
+    if (start > totalMs - _kZoomWindowMs) {
+      start = (totalMs - _kZoomWindowMs).clamp(0, totalMs);
+    }
     final end = (start + _kZoomWindowMs).clamp(0, totalMs);
     return (Duration(milliseconds: start), Duration(milliseconds: end));
   }
@@ -585,7 +597,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
           ),
 
-          // Timeline GLOBALE (toute la durée) – scrubbable
+          // Timeline GLOBALE (toute la durée)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 2),
             child: _GlobalTimelineBar(
@@ -603,7 +615,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
           ),
 
-          // Timeline ZOOM (fenêtre fixe 12 s) – scrubbable + poignées A/B
+          // Timeline ZOOM (fenêtre réglable via Réglages)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 2, 16, 2),
             child: _ZoomTimelineBar(
@@ -941,6 +953,103 @@ class MetronomeScreen extends StatelessWidget {
       child: Center(
         child: Text('Métronome (à venir)',
             style: TextStyle(fontSize: 16, color: Colors.white70)),
+      ),
+    );
+  }
+}
+
+// --------------------------------------
+// Réglages (⚙️ onglet) — prefs persistées
+// --------------------------------------
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({super.key});
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  SharedPreferences? _prefs;
+
+  static const _defaultLoopGapMs = 4000;
+  static const _defaultZoomWindowMs = 12000;
+
+  int loopGapMs = _defaultLoopGapMs;
+  int zoomWindowMs = _defaultZoomWindowMs;
+
+  final loopOptions = const [3000, 4000, 6000, 8000, 10000];
+  final zoomOptions = const [10000, 12000, 15000, 20000, 30000];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPrefs();
+  }
+
+  Future<void> _loadPrefs() async {
+    _prefs = await SharedPreferences.getInstance();
+    setState(() {
+      loopGapMs = _prefs!.getInt('loopGapMs') ?? _defaultLoopGapMs;
+      zoomWindowMs = _prefs!.getInt('zoomWindowMs') ?? _defaultZoomWindowMs;
+    });
+  }
+
+  Future<void> _savePrefs() async {
+    if (_prefs == null) return;
+    await _prefs!.setInt('loopGapMs', loopGapMs);
+    await _prefs!.setInt('zoomWindowMs', zoomWindowMs);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Réglages')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text('Durée par défaut de la boucle',
+              style: TextStyle(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          DropdownButton<int>(
+            value: loopGapMs,
+            isExpanded: true,
+            items: loopOptions
+                .map((ms) => DropdownMenuItem(
+              value: ms,
+              child: Text('${ms ~/ 1000} secondes'),
+            ))
+                .toList(),
+            onChanged: (v) {
+              if (v == null) return;
+              setState(() => loopGapMs = v);
+              _savePrefs();
+            },
+          ),
+          const SizedBox(height: 24),
+          const Text('Fenêtre zoom (timeline détaillée)',
+              style: TextStyle(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          DropdownButton<int>(
+            value: zoomWindowMs,
+            isExpanded: true,
+            items: zoomOptions
+                .map((ms) => DropdownMenuItem(
+              value: ms,
+              child: Text('${ms ~/ 1000} secondes'),
+            ))
+                .toList(),
+            onChanged: (v) {
+              if (v == null) return;
+              setState(() => zoomWindowMs = v);
+              _savePrefs();
+            },
+          ),
+          const SizedBox(height: 24),
+          const Text(
+            'Ces réglages s’appliquent quand tu crées une nouvelle boucle '
+                '(B rapide ou activation de la boucle si A/B vides).',
+            style: TextStyle(color: Colors.white70),
+          ),
+        ],
       ),
     );
   }
