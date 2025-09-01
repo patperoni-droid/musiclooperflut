@@ -1,12 +1,12 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:convert';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path/path.dart' as p;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 void main() => runApp(const LoopTrainerApp());
@@ -101,6 +101,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // Vitesse
   double speed = 1.0;
 
+  // Paramètres demandés
+  static const int _kDefaultGapMs = 4000;   // écart fixe entre A et B = 4 s
+  static const int _kZoomWindowMs = 12000;  // fenêtre zoom affichée = 12 s
+
   // ---------- cycle de vie ----------
   @override
   void initState() {
@@ -110,8 +114,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _initPrefsAndMaybeRestore() async {
     _prefs = await SharedPreferences.getInstance();
-    await _restoreSession();  // recharge si possible
-    _startAutoSave();         // autosave toutes les 2 s
+    await _restoreSession();
+    _startAutoSave();
   }
 
   void _startAutoSave() {
@@ -158,7 +162,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await _video!.initialize();
       await _video!.setLooping(false);
       await _video!.setPlaybackSpeed(speed);
-      _video!.addListener(_onVideoTick); // avance timeline + check loop
+      _video!.addListener(_onVideoTick);
       setState(() {});
     } else {
       await _audio.setFilePath(path);
@@ -167,7 +171,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _audioPosSub = _audio.positionStream.listen((_) {
         if (!mounted) return;
         _checkLoopBoundaries();
-        setState(() {}); // avance timeline
+        setState(() {});
       });
     }
 
@@ -187,7 +191,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void _onVideoTick() {
     if (!mounted) return;
     _checkLoopBoundaries();
-    setState(() {}); // avance timeline
+    setState(() {});
   }
 
   // ---------- getters durée/position ----------
@@ -243,7 +247,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
       setState(() {});
     }
-    // pas nécessaire de sauver ici, l'autosave suffit
   }
 
   Future<void> _setSpeed(double s) async {
@@ -256,24 +259,64 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await _saveSession();
   }
 
+  // ---------- fenêtre A/B auto : écart FIXE (4 s) ----------
+  void _autoSetFixedGapAroundCursor() {
+    final d = _duration;
+    if (d == Duration.zero) return;
+
+    final posMs = _position.inMilliseconds;
+    final totalMs = d.inMilliseconds;
+    final gap = _kDefaultGapMs;
+
+    int aMs = posMs - gap ~/ 2;
+    int bMs = posMs + gap ~/ 2;
+
+    // Recaler si on déborde
+    if (aMs < 0) {
+      bMs -= aMs;
+      aMs = 0;
+    }
+    if (bMs > totalMs) {
+      aMs -= (bMs - totalMs);
+      bMs = totalMs;
+      if (aMs < 0) aMs = 0;
+    }
+
+    // Double sécurité
+    if (bMs <= aMs) bMs = (aMs + gap).clamp(0, totalMs);
+    if (bMs - aMs < gap) {
+      bMs = (aMs + gap).clamp(0, totalMs);
+      if (bMs == totalMs) aMs = (bMs - gap).clamp(0, totalMs);
+    }
+
+    setState(() {
+      a = Duration(milliseconds: aMs);
+      b = Duration(milliseconds: bMs);
+    });
+    _saveSession();
+  }
+
   void _setA() {
     setState(() => a = _position);
     _saveSession();
   }
 
+  // B rapide → crée une fenêtre fixe (4 s) et active la boucle
   void _setBQuick() {
-    final pos = _position;
-    setState(() {
-      b = pos;
-      a = pos - const Duration(seconds: 4);
-      if (a!.isNegative) a = Duration.zero;
-      loopEnabled = true;
-    });
+    _autoSetFixedGapAroundCursor();
+    setState(() => loopEnabled = true);
     _saveSession();
   }
 
   void _toggleLoop() {
-    setState(() => loopEnabled = !loopEnabled);
+    if (!loopEnabled) {
+      if (a == null || b == null || b! <= a!) {
+        _autoSetFixedGapAroundCursor();
+      }
+      setState(() => loopEnabled = true);
+    } else {
+      setState(() => loopEnabled = false);
+    }
     _saveSession();
   }
 
@@ -286,11 +329,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _saveSession();
   }
 
-  /// Vérifie les bornes A/B uniquement si la boucle est activée
   void _checkLoopBoundaries() {
     if (!loopEnabled) return;
     if (a == null || b == null) return;
-
     final pos = _position;
     if (pos >= b! || pos < a!) {
       _seek(a!);
@@ -313,7 +354,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _saveSession() async {
     if (_prefs == null) return;
-    if (mediaPath == null) return; // rien à sauver sans média
+    if (mediaPath == null) return;
     final jsonStr = jsonEncode(_buildSession());
     await _prefs!.setString(_kSessionKey, jsonStr);
   }
@@ -325,7 +366,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     final data = jsonDecode(str) as Map<String, dynamic>;
     final path = data['mediaPath'] as String?;
-    if (path == null || !File(path).existsSync()) return; // fichier déplacé/supprimé ?
+    if (path == null || !File(path).existsSync()) return;
 
     final wasVideo = (data['isVideo'] as bool?) ?? false;
     final savedSpeed = (data['speed'] as num?)?.toDouble() ?? 1.0;
@@ -363,9 +404,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       });
     }
 
-    // seek à la position sauvegardée
-    final target = Duration(milliseconds: posMs);
-    await _seek(target);
+    await _seek(Duration(milliseconds: posMs));
   }
 
   // ---------- util ----------
@@ -375,12 +414,30 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return '$m:$s';
   }
 
+  // Fenêtre de zoom (12 s) centrée sur la boucle ou le curseur
+  (Duration, Duration) _zoomWindow() {
+    final d = _duration;
+    if (d == Duration.zero) return (Duration.zero, Duration.zero);
+    final totalMs = d.inMilliseconds;
+    final centerMs = (a != null && b != null)
+        ? ((a!.inMilliseconds + b!.inMilliseconds) ~/ 2)
+        : _position.inMilliseconds;
+
+    int start = centerMs - _kZoomWindowMs ~/ 2;
+    if (start < 0) start = 0;
+    if (start > totalMs - _kZoomWindowMs) start = (totalMs - _kZoomWindowMs).clamp(0, totalMs);
+    final end = (start + _kZoomWindowMs).clamp(0, totalMs);
+    return (Duration(milliseconds: start), Duration(milliseconds: end));
+  }
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final isPlayingNow =
     isVideo ? (_video?.value.isPlaying ?? false) : _audio.playing;
     const speedSteps = [0.5, 0.7, 1.0, 1.2, 1.5];
+
+    final (winStart, winEnd) = _zoomWindow();
 
     return SafeArea(
       child: Column(
@@ -406,7 +463,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
           ),
 
-          // Zone vidéo / audio
+          // Zone média
           Expanded(
             child: Container(
               margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -501,19 +558,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   active: a != null,
                   color: cs.secondary,
                   onPressed: _setA,
-                  onLongPress: () => setState(() => a = null), // efface A
+                  onLongPress: () => setState(() => a = null),
                 ),
                 Row(
                   children: [
                     IconButton(
-                      tooltip: loopEnabled
-                          ? 'Désactiver la boucle'
-                          : 'Activer la boucle',
+                      tooltip: loopEnabled ? 'Désactiver la boucle' : 'Activer la boucle',
                       onPressed: _toggleLoop,
-                      icon: Icon(
-                        Icons.loop,
-                        color: loopEnabled ? cs.secondary : Colors.white,
-                      ),
+                      icon: Icon(Icons.loop, color: loopEnabled ? cs.secondary : Colors.white),
                     ),
                     IconButton(
                       tooltip: 'Réinitialiser A/B',
@@ -527,16 +579,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   active: b != null,
                   color: cs.secondary,
                   onPressed: _setBQuick,
-                  onLongPress: () => setState(() => b = null), // efface B
+                  onLongPress: () => setState(() => b = null),
                 ),
               ],
             ),
           ),
 
-          // Timeline
+          // Timeline GLOBALE (toute la durée) – scrubbable
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 2),
-            child: _TimelineBar(
+            child: _GlobalTimelineBar(
               duration: _duration,
               position: _position,
               a: a,
@@ -548,18 +600,40 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 final targetMs = (d.inMilliseconds * ratio).round();
                 _seek(Duration(milliseconds: targetMs));
               },
+            ),
+          ),
+
+          // Timeline ZOOM (fenêtre fixe 12 s) – scrubbable + poignées A/B
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 2, 16, 2),
+            child: _ZoomTimelineBar(
+              duration: _duration,
+              position: _position,
+              a: a,
+              b: b,
+              windowStart: winStart,
+              windowEnd: winEnd,
+              accent: cs.secondary,
+              onScrub: (ratio) {
+                final startMs = winStart.inMilliseconds;
+                final visMs = (winEnd - winStart).inMilliseconds;
+                final targetMs = startMs + (visMs * ratio).round();
+                _seek(Duration(milliseconds: targetMs));
+              },
               onDragA: (ratio) {
-                final d = _duration;
-                if (d == Duration.zero) return;
-                setState(() => a =
-                    Duration(milliseconds: (d.inMilliseconds * ratio).round()));
+                final startMs = winStart.inMilliseconds;
+                final visMs = (winEnd - winStart).inMilliseconds;
+                setState(() {
+                  a = Duration(milliseconds: startMs + (visMs * ratio).round());
+                });
                 _saveSession();
               },
               onDragB: (ratio) {
-                final d = _duration;
-                if (d == Duration.zero) return;
-                setState(() => b =
-                    Duration(milliseconds: (d.inMilliseconds * ratio).round()));
+                final startMs = winStart.inMilliseconds;
+                final visMs = (winEnd - winStart).inMilliseconds;
+                setState(() {
+                  b = Duration(milliseconds: startMs + (visMs * ratio).round());
+                });
                 _saveSession();
               },
             ),
@@ -580,43 +654,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
           // Vitesse
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-            child: Column(
-              children: [
-                SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    trackHeight: 3,
-                    thumbShape:
-                    const RoundSliderThumbShape(enabledThumbRadius: 8),
-                  ),
-                  child: Slider(
-                    value: speed,
-                    min: 0.5,
-                    max: 1.5,
-                    divisions: 20,
-                    label: '${speed.toStringAsFixed(2)}×',
-                    onChanged: (v) => _setSpeed(v),
-                  ),
-                ),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: speedSteps.map((v) {
-                    final selected = (speed - v).abs() < 0.025;
-                    return GestureDetector(
-                      onTap: () => _setSpeed(v),
-                      child: Text(
-                        v == 1.0 ? '1×' : '${v.toStringAsFixed(1)}×',
-                        style: TextStyle(
-                          color: selected
-                              ? Theme.of(context).colorScheme.primary
-                              : Colors.white70,
-                          fontWeight:
-                          selected ? FontWeight.w600 : FontWeight.w400,
-                        ),
-                      ),
-                    );
-                  }).toList(),
-                ),
-              ],
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 3,
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+              ),
+              child: Slider(
+                value: speed,
+                min: 0.5,
+                max: 1.5,
+                divisions: 20,
+                label: '${speed.toStringAsFixed(2)}×',
+                onChanged: (v) => _setSpeed(v),
+              ),
             ),
           ),
         ],
@@ -675,13 +725,86 @@ class _ABSmallButton extends StatelessWidget {
   }
 }
 
-/// -------------------- Timeline simple (scrubbable) --------------------
-class _TimelineBar extends StatefulWidget {
-  const _TimelineBar({
+/// -------------------- Timeline GLOBALE --------------------
+class _GlobalTimelineBar extends StatelessWidget {
+  const _GlobalTimelineBar({
     required this.duration,
     required this.position,
     required this.a,
     required this.b,
+    required this.accent,
+    required this.onScrub,
+  });
+
+  final Duration duration;
+  final Duration position;
+  final Duration? a;
+  final Duration? b;
+  final Color accent;
+  final ValueChanged<double> onScrub; // ratio 0..1
+
+  @override
+  Widget build(BuildContext context) {
+    final dMs = duration.inMilliseconds == 0 ? 1 : duration.inMilliseconds;
+    final p = position.inMilliseconds / dMs;
+    final aR = (a?.inMilliseconds ?? 0) / dMs;
+    final bR = (b?.inMilliseconds ?? dMs) / dMs;
+
+    return LayoutBuilder(
+      builder: (context, c) {
+        final w = c.maxWidth;
+        double dxFromR(double r) => r.clamp(0.0, 1.0) * w;
+
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (e) => onScrub((e.localPosition.dx / (w == 0 ? 1 : w)).clamp(0.0, 1.0)),
+          onHorizontalDragUpdate: (e) => onScrub((e.localPosition.dx / (w == 0 ? 1 : w)).clamp(0.0, 1.0)),
+          child: SizedBox(
+            height: 24,
+            child: Stack(
+              alignment: Alignment.centerLeft,
+              children: [
+                Container(
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white10,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                if (a != null && b != null)
+                  Positioned(
+                    left: dxFromR(aR),
+                    right: w - dxFromR(bR),
+                    child: Container(
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: accent.withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                Positioned(
+                  left: dxFromR(p) - 1,
+                  child: Container(width: 2, height: 12, color: Colors.white),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// -------------------- Timeline ZOOM (fenêtre fixe) --------------------
+class _ZoomTimelineBar extends StatelessWidget {
+  const _ZoomTimelineBar({
+    required this.duration,
+    required this.position,
+    required this.a,
+    required this.b,
+    required this.windowStart,
+    required this.windowEnd,
     required this.accent,
     required this.onScrub,
     required this.onDragA,
@@ -692,87 +815,81 @@ class _TimelineBar extends StatefulWidget {
   final Duration position;
   final Duration? a;
   final Duration? b;
+  final Duration windowStart;
+  final Duration windowEnd;
   final Color accent;
 
-  /// 0..1
-  final ValueChanged<double> onScrub;
-  final ValueChanged<double> onDragA;
-  final ValueChanged<double> onDragB;
-
-  @override
-  State<_TimelineBar> createState() => _TimelineBarState();
-}
-
-class _TimelineBarState extends State<_TimelineBar> {
-  final GlobalKey _key = GlobalKey();
-
-  double _ratioFromDx(double dx) {
-    final box = _key.currentContext!.findRenderObject() as RenderBox;
-    final w = box.size.width;
-    return (dx.clamp(0, w)) / w;
-  }
-
-  double _width() {
-    final box = _key.currentContext?.findRenderObject() as RenderBox?;
-    return box?.size.width ?? 0;
-  }
+  final ValueChanged<double> onScrub; // 0..1 dans la fenêtre
+  final ValueChanged<double> onDragA; // 0..1
+  final ValueChanged<double> onDragB; // 0..1
 
   @override
   Widget build(BuildContext context) {
-    final dMs =
-    widget.duration.inMilliseconds == 0 ? 1 : widget.duration.inMilliseconds;
-    final p = widget.position.inMilliseconds / dMs;
-    final a = (widget.a?.inMilliseconds ?? 0) / dMs;
-    final b = (widget.b?.inMilliseconds ?? dMs) / dMs;
+    final totalMs = duration.inMilliseconds == 0 ? 1 : duration.inMilliseconds;
+    final ws = windowStart.inMilliseconds.clamp(0, totalMs);
+    final we = windowEnd.inMilliseconds.clamp(0, totalMs);
+    final visMs = (we - ws).clamp(1, totalMs);
 
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapDown: (e) => widget.onScrub(_ratioFromDx(e.localPosition.dx)),
-      onHorizontalDragUpdate: (e) =>
-          widget.onScrub(_ratioFromDx(e.localPosition.dx)),
-      child: SizedBox(
-        height: 42,
-        child: Stack(
-          alignment: Alignment.centerLeft,
-          children: [
-            Container(
-              key: _key,
-              height: 6,
-              decoration: BoxDecoration(
-                color: Colors.white10,
-                borderRadius: BorderRadius.circular(3),
-              ),
-            ),
-            Positioned.fill(
-              left: a * _width(),
-              right: (1 - b) * _width(),
-              child: Container(
-                height: 6,
-                decoration: BoxDecoration(
-                  color: widget.accent.withOpacity(0.25),
-                  borderRadius: BorderRadius.circular(3),
+    double rFromMs(int ms) => ((ms - ws) / visMs).clamp(0.0, 1.0);
+    final pR = rFromMs(position.inMilliseconds);
+    final aR = a != null ? rFromMs(a!.inMilliseconds) : null;
+    final bR = b != null ? rFromMs(b!.inMilliseconds) : null;
+
+    return LayoutBuilder(
+      builder: (context, c) {
+        final w = c.maxWidth;
+        double dx(double r) => r.clamp(0.0, 1.0) * w;
+
+        void _scrubAt(double x) =>
+            onScrub(((x.clamp(0, w)) / (w == 0 ? 1 : w)).clamp(0.0, 1.0));
+
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (e) => _scrubAt(e.localPosition.dx),
+          onHorizontalDragUpdate: (e) => _scrubAt(e.localPosition.dx),
+          child: SizedBox(
+            height: 42,
+            child: Stack(
+              alignment: Alignment.centerLeft,
+              children: [
+                Container(
+                  height: 6,
+                  decoration: BoxDecoration(
+                    color: Colors.white10,
+                    borderRadius: BorderRadius.circular(3),
+                  ),
                 ),
-              ),
+                if (aR != null && bR != null)
+                  Positioned(
+                    left: dx(aR),
+                    right: w - dx(bR),
+                    child: Container(
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: accent.withOpacity(0.25),
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                    ),
+                  ),
+                Positioned(
+                  left: dx(pR) - 1,
+                  child: Container(width: 2, height: 16, color: Colors.white),
+                ),
+                if (aR != null)
+                  _Handle(dx: dx(aR), color: accent, onDrag: (newDx) {
+                    final r = ((newDx.clamp(0, w)) / (w == 0 ? 1 : w)).clamp(0.0, 1.0);
+                    onDragA(r);
+                  }),
+                if (bR != null)
+                  _Handle(dx: dx(bR), color: accent, onDrag: (newDx) {
+                    final r = ((newDx.clamp(0, w)) / (w == 0 ? 1 : w)).clamp(0.0, 1.0);
+                    onDragB(r);
+                  }),
+              ],
             ),
-            Positioned(
-              left: p * _width() - 1,
-              child: Container(width: 2, height: 16, color: Colors.white),
-            ),
-            if (widget.a != null)
-              _Handle(
-                dx: a * _width(),
-                color: widget.accent,
-                onDrag: (dx) => widget.onDragA(_ratioFromDx(dx)),
-              ),
-            if (widget.b != null)
-              _Handle(
-                dx: b * _width(),
-                color: widget.accent,
-                onDrag: (dx) => widget.onDragB(_ratioFromDx(dx)),
-              ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }
