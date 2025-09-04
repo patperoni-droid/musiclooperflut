@@ -9,7 +9,11 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.8  # ok de le laisser, ne pose pas de souci
+  cupertino_icons: ^1.0.8
+  file_picker: ^8.1.2
+  just_audio: ^0.9.42
+  video_player: ^2.9.2
+  shared_preferences: ^2.2.2
 
 dev_dependencies:
   flutter_test:
