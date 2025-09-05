@@ -409,47 +409,33 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Widget _buildLoopSlider(double durMs, double aMs, double bMs) {
     final enabled = durMs > 0;
 
-    return Column(
-      children: [
-        SliderTheme(
-          data: SliderTheme.of(context).copyWith(
-            trackHeight: 3,
-            rangeThumbShape:
-            const RoundRangeSliderThumbShape(enabledThumbRadius: 7),
-            thumbColor: Colors.amber,
-            activeTrackColor: Colors.amber,
-            inactiveTrackColor: Colors.white24,
-          ),
-          child: RangeSlider(
-            values: RangeValues(
-              enabled ? (aMs / (durMs == 0 ? 1 : durMs)) : 0.0,
-              enabled ? (bMs / (durMs == 0 ? 1 : durMs)) : 1.0,
-            ),
-            onChanged: !enabled
-                ? null
-                : (rv) {
-              final na =
-              Duration(milliseconds: (rv.start * durMs).toInt());
-              final nb =
-              Duration(milliseconds: (rv.end * durMs).toInt());
-              setState(() {
-                _a = na;
-                _b = nb;
-              });
-            },
-          ),
+    return SliderTheme(
+      data: SliderTheme.of(context).copyWith(
+        trackHeight: 3,
+        rangeThumbShape:
+        const RoundRangeSliderThumbShape(enabledThumbRadius: 7),
+        thumbColor: Colors.amber,
+        activeTrackColor: Colors.amber,
+        inactiveTrackColor: Colors.white24,
+      ),
+      child: RangeSlider(
+        values: RangeValues(
+          enabled ? (aMs / (durMs == 0 ? 1 : durMs)) : 0.0,
+          enabled ? (bMs / (durMs == 0 ? 1 : durMs)) : 1.0,
         ),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text('A: ${_a == null ? '--:--' : _fmt(_a!)}',
-                style: const TextStyle(color: Colors.white70)),
-            Text('B: ${_b == null ? '--:--' : _fmt(_b!)}',
-                style: const TextStyle(color: Colors.white70)),
-          ],
-        ),
-      ],
+        onChanged: !enabled
+            ? null
+            : (rv) {
+          final na = Duration(milliseconds: (rv.start * durMs).toInt());
+          final nb = Duration(milliseconds: (rv.end * durMs).toInt());
+          setState(() {
+            _a = na;
+            _b = nb;
+          });
+        },
+      ),
     );
+
   }
 
   Widget _buildSpeedRow() {
@@ -478,6 +464,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
       disabledForegroundColor: Colors.white24,
       iconSize: 28,
     );
+
+    // Styles A/B selon état de la boucle
+    final abOffBg = Colors.white10;
+    final abOnBg  = Colors.amber.shade700;
+    final abFgOff = Colors.white70;
+    final abFgOn  = Colors.black;
 
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
@@ -508,31 +500,41 @@ class _PlayerScreenState extends State<PlayerScreen> {
               : () => _seekRel(const Duration(seconds: 5)),
           icon: const Icon(Icons.forward_5),
         ),
-        const SizedBox(width: 10),
+        const SizedBox(width: 12),
 
-        // Bouton A
+        // Bouton A (pose A = position)
         FilledButton.tonal(
+          style: FilledButton.styleFrom(
+            backgroundColor: _loopEnabled ? abOnBg : abOffBg,
+            foregroundColor: _loopEnabled ? abFgOn : abFgOff,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          ),
           onPressed: _duration == Duration.zero ? null : _markA,
-          child: Text('A ${_a == null ? '' : _fmt(_a!)}'),
+          child: const Text('A'),
         ),
         const SizedBox(width: 8),
 
         // Bouton B (pose B = now, A = B-4s, active boucle)
         FilledButton.tonal(
+          style: FilledButton.styleFrom(
+            backgroundColor: _loopEnabled ? abOnBg : abOffBg,
+            foregroundColor: _loopEnabled ? abFgOn : abFgOff,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          ),
           onPressed: _duration == Duration.zero ? null : _markBAndAutoLoop,
-          child: Text('B ${_b == null ? '' : _fmt(_b!)}'),
+          child: const Text('B'),
         ),
-        const SizedBox(width: 10),
+        const SizedBox(width: 12),
 
-        // Toggle boucle
-        FilterChip(
-          selectedColor: Colors.amber.shade700,
-          checkmarkColor: Colors.white,
-          label: const Text('A↻B', style: TextStyle(color: Colors.white)),
-          selected: _loopEnabled,
-          onSelected: (_) => _toggleLoop(),
+        // Toggle boucle (🔁) on/off sans perdre A/B
+        IconButton(
+          tooltip: _loopEnabled ? 'Boucle ON' : 'Boucle OFF',
+          onPressed: (_a != null && _b != null) ? _toggleLoop : null,
+          icon: Icon(
+            Icons.repeat,
+            color: _loopEnabled ? Colors.amber : Colors.white70,
+          ),
         ),
-        const SizedBox(width: 6),
 
         // Effacer A/B
         IconButton(
