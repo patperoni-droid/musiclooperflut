@@ -2,17 +2,11 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:video_player/video_player.dart';
-
-// --- helpers ---
-Duration _clampDur(Duration d, Duration min, Duration max) {
-  if (d < min) return min;
-  if (d > max) return max;
-  return d;
-}
+import 'package:path/path.dart' as p;
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key});
@@ -22,33 +16,45 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // Media
-  String? _path;
+  // --------- Constantes / helpers ----------
+  static const Duration _kQuickGap = Duration(seconds: 4);
+
+  Duration _clampDur(Duration d, Duration min, Duration max) {
+    if (d < min) return min;
+    if (d > max) return max;
+    return d;
+  }
+
+  String _fmt(Duration d) {
+    final s = d.inSeconds;
+    final mm = (s ~/ 60).toString().padLeft(2, '0');
+    final ss = (s % 60).toString().padLeft(2, '0');
+    return '$mm:$ss';
+  }
+
+  // --------- Etat média ----------
+  String? _mediaPath;
   bool _isVideo = false;
 
-  // Players
   VideoPlayerController? _video;
-  final AudioPlayer _audio = AudioPlayer();
-  StreamSubscription<Duration>? _audioPosSub;
+  final _audio = AudioPlayer();
 
-  // Durations
+  // Timeline
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
 
-  // Loop A/B
+  // Boucle A/B
   Duration? _a;
   Duration? _b;
   bool _loopEnabled = false;
 
-  // Speed
+  // Vitesse
   double _speed = 1.0;
 
-  // Ticker pour gérer le rebouclage
+  // Ticker de position
   Timer? _ticker;
 
-  // Ecart par défaut pour la pose rapide de boucle via B
-  static const Duration _kQuickGap = Duration(seconds: 4);
-
+  // --------- Cycle de vie ----------
   @override
   void initState() {
     super.initState();
@@ -58,182 +64,197 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void dispose() {
     _ticker?.cancel();
-    _audioPosSub?.cancel();
-    _audio.dispose();
-    _video?.removeListener(_onVideoTick);
     _video?.dispose();
+    _audio.dispose();
     super.dispose();
   }
 
-  // ------------------ Fichier ------------------
+  void _startTicker() {
+    _ticker?.cancel();
+    _ticker = Timer.periodic(const Duration(milliseconds: 120), (_) async {
+      if (!mounted) return;
+      final pos = await _currentPosition();
+      final dur = await _currentDuration();
+
+      if (pos != _position || dur != _duration) {
+        setState(() {
+          _position = pos;
+          _duration = dur;
+        });
+      }
+
+      // Gestion de la boucle
+      if (_loopEnabled && _a != null && _b != null && _b! > _a!) {
+        if (pos >= _b!) {
+          unawaited(_seek(_a!));
+        }
+      }
+    });
+  }
+
+  Future<Duration> _currentPosition() async {
+    if (_isVideo) {
+      final v = _video;
+      if (v == null) return Duration.zero;
+      return v.value.position;
+    } else {
+      return _audio.position;
+    }
+  }
+
+  Future<Duration> _currentDuration() async {
+    if (_isVideo) {
+      final v = _video;
+      if (v == null) return Duration.zero;
+      return v.value.duration ?? Duration.zero;
+    } else {
+      return _audio.duration ?? Duration.zero;
+    }
+  }
+
+  // --------- Ouverture média ----------
   Future<void> _pickFile() async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: [
-        // vidéo
-        'mp4', 'mov', 'm4v', 'webm',
         // audio
-        'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg',
+        'mp3', 'm4a', 'aac', 'wav', 'ogg', 'flac',
+        // video
+        'mp4', 'mov', 'mkv', 'webm'
       ],
     );
-    if (res == null || res.files.isEmpty) return;
-    final p = res.files.single.path;
-    if (p == null) return;
+    if (res == null || res.files.single.path == null) return;
 
-    _path = p;
-    _isVideo = _isVideoExt(p);
-    await _loadMedia();
-  }
+    final path = res.files.single.path!;
+    final ext = p.extension(path).toLowerCase();
 
-  bool _isVideoExt(String p) {
-    final lower = p.toLowerCase();
-    return lower.endsWith('.mp4') ||
-        lower.endsWith('.mov') ||
-        lower.endsWith('.m4v') ||
-        lower.endsWith('.webm');
-  }
+    _stop();
 
-  Future<void> _loadMedia() async {
-    // Stop & reset
-    _ticker?.cancel();
-    _audioPosSub?.cancel();
-    await _audio.stop();
-    _video?.removeListener(_onVideoTick);
-    await _video?.pause();
-    await _video?.dispose();
-    _video = null;
+    if (['.mp4', '.mov', '.mkv', '.webm'].contains(ext)) {
+      // Vidéo
+      final controller = VideoPlayerController.file(File(path));
+      await controller.initialize();
+      await controller.setLooping(false);
+      await controller.setPlaybackSpeed(_speed);
+      setState(() {
+        _isVideo = true;
+        _mediaPath = path;
+        _video = controller;
+      });
+      await controller.play();
+    } else {
+      // Audio
+      await _audio.setFilePath(path);
+      await _audio.setLoopMode(LoopMode.off);
+      await _audio.setSpeed(_speed);
+      setState(() {
+        _isVideo = false;
+        _mediaPath = path;
+      });
+      await _audio.play();
+    }
 
+    // Reset de la boucle
     setState(() {
-      _duration = Duration.zero;
-      _position = Duration.zero;
       _a = null;
       _b = null;
       _loopEnabled = false;
     });
-
-    if (_path == null) return;
-
-    if (_isVideo) {
-      final c = VideoPlayerController.file(File(_path!));
-      await c.initialize();
-      await c.setLooping(false);
-      await c.setPlaybackSpeed(_speed);
-      _video = c;
-
-      _duration = c.value.duration;
-      c.addListener(_onVideoTick);
-
-      _startTicker();
-      setState(() {});
-    } else {
-      await _audio.setFilePath(_path!);
-      await _audio.setSpeed(_speed);
-      // force un pitch neutre si dispo
-      try {
-        await _audio.setPitch(1.0);
-      } catch (_) {}
-      _duration = _audio.duration ?? Duration.zero;
-
-      _audioPosSub = _audio.positionStream.listen((pos) {
-        if (!mounted) return;
-        setState(() => _position = pos);
-      });
-
-      _startTicker();
-      setState(() {});
-    }
-  }
-
-  // ------------------ Lecture / Seek ------------------
-  Future<void> _playPause() async {
-    if (_isVideo) {
-      final c = _video;
-      if (c == null) return;
-      if (c.value.isPlaying) {
-        await c.pause();
-      } else {
-        await c.play();
-      }
-    } else {
-      if (_audio.playing) {
-        await _audio.pause();
-      } else {
-        await _audio.play();
-      }
-    }
-    setState(() {});
   }
 
   Future<void> _seek(Duration d) async {
-    if (_duration == Duration.zero) return;
     d = _clampDur(d, Duration.zero, _duration);
     if (_isVideo) {
       await _video?.seekTo(d);
     } else {
       await _audio.seek(d);
     }
-    setState(() => _position = d);
   }
 
-  Future<void> _seekRel(Duration delta) => _seek(_position + delta);
-
-  // ------------------ Vitesse ------------------
-  Future<void> _setSpeed(double s) async {
-    _speed = s;
+  Future<void> _playPause() async {
     if (_isVideo) {
-      await _video?.setPlaybackSpeed(s);
+      final v = _video;
+      if (v == null) return;
+      if (v.value.isPlaying) {
+        await v.pause();
+      } else {
+        await v.play();
+      }
+      setState(() {});
     } else {
-      try {
-        await _audio.setPitch(1.0);
-      } catch (_) {}
-      await _audio.setSpeed(s);
+      if (_audio.playing) {
+        await _audio.pause();
+      } else {
+        await _audio.play();
+      }
+      setState(() {});
     }
-    setState(() {});
   }
 
-  // ------------------ Boucle A/B ------------------
-  void _markA() {
-    if (_duration == Duration.zero) return;
+  Future<void> _stop() async {
+    _loopEnabled = false;
+    _a = null;
+    _b = null;
+    if (_isVideo) {
+      await _video?.pause();
+      await _video?.dispose();
+      _video = null;
+    } else {
+      await _audio.stop();
+    }
+  }
 
+  // --------- Marqueurs A / B ----------
+  // A posé d'abord -> A prend la position courante. Si B existe déjà, on s’assure B > A (≥ A+4s)
+  void _markA() {
+    final now = _position;
     setState(() {
-      _a = _position;
-      // si B existe déjà et que B > A → active la boucle
-      if (_b != null && _b! > _a!) {
+      _a = now;
+      if (_b != null) {
+        if (_b! <= _a!) {
+          _b = _clampDur(_a! + _kQuickGap, Duration.zero, _duration);
+        }
         _loopEnabled = true;
       }
     });
   }
 
+  // B posé : si A inexistant, A = B - 4s (borné) ; sinon B = now (au moins A+4s), active la boucle
   void _markBAndAutoLoop() {
-    if (_duration == Duration.zero) return;
-
-    final b = _position;
+    final now = _position;
 
     if (_a == null) {
-      // si A n’existe pas → A = B – 4s
-      final aCandidate = b - _kQuickGap;
-      final a = _clampDur(aCandidate, Duration.zero, _duration);
+      final aCand = now - _kQuickGap;
+      final a = _clampDur(aCand, Duration.zero, _duration);
       setState(() {
         _a = a;
-        _b = b;
-        _loopEnabled = true; // active la boucle
+        _b = now;
+        _loopEnabled = true;
       });
     } else {
-      // si A existe déjà
+      var bFixed = now;
+      if (bFixed <= _a!) {
+        bFixed = _clampDur(_a! + _kQuickGap, Duration.zero, _duration);
+      }
       setState(() {
-        _b = b;
-        if (_b! > _a!) {
-          _loopEnabled = true;
-        }
+        _b = bFixed;
+        _loopEnabled = true;
       });
     }
   }
 
+  void _clearLoop() {
+    setState(() {
+      _a = null;
+      _b = null;
+      _loopEnabled = false;
+    });
+  }
+
+  // Toggle rapide ON/OFF sans perdre A/B (si A/B manquent, on crée une petite fenêtre autour du curseur)
   void _toggleLoop() {
-    // petit toggle pour couper/réactiver la boucle sans perdre A/B
-    if (_a == null || _b == null || _b! <= _a!) {
-      // si A/B pas valides, on crée une fenêtre rapide autour du curseur
-      final half = Duration(milliseconds: _kQuickGap.inMilliseconds ~/ 2);
+    if (_a == null || _b == null || !(_b! > _a!)) {
+      final half = const Duration(milliseconds: 2000);
       final a = _clampDur(_position - half, Duration.zero, _duration);
       var b = _clampDur(_position + half, Duration.zero, _duration);
       if (b <= a) b = _clampDur(a + _kQuickGap, Duration.zero, _duration);
@@ -247,319 +268,207 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  void _clearLoop() {
-    setState(() {
-      _a = null;
-      _b = null;
-      _loopEnabled = false;
-    });
+  // Vitesse
+  Future<void> _setSpeed(double v) async {
+    setState(() => _speed = v);
+    if (_isVideo) {
+      await _video?.setPlaybackSpeed(v);
+    } else {
+      await _audio.setSpeed(v);
+    }
   }
 
-  // ------------------ Ticker / callbacks ------------------
-  void _onVideoTick() {
-    final v = _video;
-    if (v == null) return;
-    final pos = v.value.position;
-    if (!mounted) return;
-    setState(() => _position = pos);
-  }
-
-  void _startTicker() {
-    _ticker?.cancel();
-    _ticker = Timer.periodic(const Duration(milliseconds: 80), (_) async {
-      if (!_loopEnabled || _a == null || _b == null) return;
-      final a = _a!;
-      final b = _b!;
-      if (b <= a) return;
-
-      final pos = _position;
-      if (pos >= b - const Duration(milliseconds: 40)) {
-        await _seek(a);
-        if (_isVideo) {
-          if (!(_video?.value.isPlaying ?? false)) {
-            await _video?.play();
-          }
-        } else {
-          if (!_audio.playing) await _audio.play();
-        }
-      }
-    });
-  }
-
-  // ------------------ UI helpers ------------------
-  String _fmt(Duration d) {
-    final s = d.inSeconds;
-    final m = s ~/ 60;
-    final r = s % 60;
-    return '${m.toString().padLeft(2, '0')}:${r.toString().padLeft(2, '0')}';
-  }
-
+  // --------- UI ----------
   @override
   Widget build(BuildContext context) {
-    final isPlaying =
-    _isVideo ? (_video?.value.isPlaying ?? false) : _audio.playing;
+    final theme = Theme.of(context);
+    final isPlaying = _isVideo ? (_video?.value.isPlaying ?? false) : _audio.playing;
+
+    final aVal = _a ?? Duration.zero;
+    final bVal = _b ?? (_duration == Duration.zero ? const Duration(seconds: 1) : _duration);
 
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        backgroundColor: Colors.black,
-        title: const Text('MusicLooper'),
+        title: Text(
+          _mediaPath == null ? 'Lecteur' : p.basename(_mediaPath!),
+          overflow: TextOverflow.ellipsis,
+        ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.folder_open),
             tooltip: 'Ouvrir un fichier',
             onPressed: _pickFile,
+            icon: const Icon(Icons.folder_open),
           ),
         ],
       ),
-      body: SafeArea(
-        child: Stack(
-          children: [
-            // Média (vidéo plein écran, sinon fond noir)
-            Positioned.fill(child: _buildMedia()),
-
-            // Panneau bas (contrôles minimalistes)
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: _buildBottomPanel(isPlaying),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildMedia() {
-    if (_isVideo && _video != null && _video!.value.isInitialized) {
-      final ar = _video!.value.aspectRatio;
-      return Center(
-        child: AspectRatio(
-          aspectRatio: ar == 0 ? 16 / 9 : ar,
-          child: VideoPlayer(_video!),
-        ),
-      );
-    }
-    return Container(color: Colors.black);
-  }
-
-  Widget _buildBottomPanel(bool isPlaying) {
-    final durMs =
-    _duration.inMilliseconds.toDouble().clamp(0.0, double.infinity);
-    final posMs = _position.inMilliseconds.toDouble().clamp(0.0, durMs);
-    final aMs =
-    (_a?.inMilliseconds.toDouble() ?? 0.0).clamp(0.0, durMs);
-    final bMs =
-    (_b?.inMilliseconds.toDouble() ?? (durMs > 0 ? durMs : 0.0))
-        .clamp(0.0, durMs);
-
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment(0, -1),
-          end: Alignment(0, 1),
-          colors: [Colors.transparent, Color.fromARGB(210, 0, 0, 0)],
-        ),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
+      body: Column(
         children: [
-          // Barre de progression fine (seek)
-          _buildPositionSlider(durMs, posMs),
+          // Zone vidéo (ou placeholder audio)
+          Expanded(
+            child: Center(
+              child: _isVideo && _video != null && _video!.value.isInitialized
+                  ? AspectRatio(
+                aspectRatio: _video!.value.aspectRatio,
+                child: VideoPlayer(_video!),
+              )
+                  : _mediaPath == null
+                  ? Text('Aucun média', style: theme.textTheme.titleMedium?.copyWith(color: Colors.white70))
+                  : const Icon(Icons.audiotrack, size: 96, color: Colors.white54),
+            ),
+          ),
 
-          const SizedBox(height: 8),
+          // Barre de progression
+          if (_duration > Duration.zero)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              child: Row(
+                children: [
+                  Text(_fmt(_position), style: const TextStyle(color: Colors.white70)),
+                  Expanded(
+                    child: Slider(
+                      value: _position.inMilliseconds.toDouble().clamp(0.0, _duration.inMilliseconds.toDouble()),
+                      min: 0,
+                      max: _duration.inMilliseconds.toDouble(),
+                      onChanged: (v) => _seek(Duration(milliseconds: v.round())),
+                    ),
+                  ),
+                  Text(_fmt(_duration), style: const TextStyle(color: Colors.white70)),
+                ],
+              ),
+            ),
 
-          // Slider A/B (poignées)
-          _buildLoopSlider(durMs, aMs, bMs),
-
-          const SizedBox(height: 8),
+          // Poignées de boucle (RangeSlider) + boutons A/B/Clear + ON/OFF
+          if (_duration > Duration.zero)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Column(
+                children: [
+                  // A/B buttons + toggle + clear
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      // A
+                      FilledButton.tonal(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _a == null ? Colors.grey.shade800 : null,
+                        ),
+                        onPressed: _markA,
+                        child: const Text('A'),
+                      ),
+                      const SizedBox(width: 12),
+                      // B
+                      FilledButton.tonal(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _b == null ? Colors.grey.shade800 : null,
+                        ),
+                        onPressed: _markBAndAutoLoop,
+                        child: const Text('B'),
+                      ),
+                      const SizedBox(width: 12),
+                      // ON/OFF
+                      IconButton.filled(
+                        isSelected: _loopEnabled,
+                        selectedIcon: const Icon(Icons.repeat_on),
+                        icon: const Icon(Icons.repeat),
+                        onPressed: _toggleLoop,
+                      ),
+                      const SizedBox(width: 8),
+                      // clear
+                      IconButton(
+                        tooltip: 'Supprimer la boucle',
+                        onPressed: _clearLoop,
+                        icon: const Icon(Icons.close),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  // Range slider pour A/B
+                  RangeSlider(
+                    values: RangeValues(
+                      aVal.inMilliseconds.toDouble(),
+                      bVal.inMilliseconds.toDouble(),
+                    ),
+                    min: 0,
+                    max: _duration.inMilliseconds.toDouble().clamp(1, double.infinity),
+                    onChanged: (rv) {
+                      // On garde l’ordre A <= B
+                      var aMs = rv.start.round();
+                      var bMs = rv.end.round();
+                      if (bMs <= aMs) bMs = aMs + 1;
+                      setState(() {
+                        _a = Duration(milliseconds: aMs);
+                        _b = Duration(milliseconds: bMs);
+                      });
+                    },
+                    onChangeEnd: (_) {
+                      if (_a != null && _b != null && _b! > _a!) {
+                        setState(() => _loopEnabled = true);
+                      }
+                    },
+                  ),
+                  // Légende A/B
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text('A ${_fmt(aVal)}', style: const TextStyle(color: Colors.white70)),
+                      Text('B ${_fmt(bVal)}', style: const TextStyle(color: Colors.white70)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
 
           // Vitesse
-          _buildSpeedRow(),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 14),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.speed, color: Colors.white70),
+                    const SizedBox(width: 8),
+                    Text('Vitesse ${_speed.toStringAsFixed(2)}x',
+                        style: const TextStyle(color: Colors.white70)),
+                  ],
+                ),
+                Slider(
+                  value: _speed,
+                  min: 0.5,
+                  max: 1.5,
+                  onChanged: (v) => _setSpeed(double.parse(v.toStringAsFixed(2))),
+                ),
+              ],
+            ),
+          ),
 
-          const SizedBox(height: 8),
-
-          // Contrôles + A/B rapides
-          _buildControlsRow(isPlaying),
+          // Contrôles lecture minimalistes
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                IconButton(
+                  tooltip: 'Reculer 5s',
+                  onPressed: () => _seek(_position - const Duration(seconds: 5)),
+                  icon: const Icon(Icons.replay_5, color: Colors.white),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: _playPause,
+                  child: Icon(isPlaying ? Icons.pause : Icons.play_arrow),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Avancer 5s',
+                  onPressed: () => _seek(_position + const Duration(seconds: 5)),
+                  icon: const Icon(Icons.forward_5, color: Colors.white),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
-    );
-  }
-
-  // --- Widgets détaillés ---
-
-  Widget _buildPositionSlider(double durMs, double posMs) {
-    final enabled = durMs > 0;
-    return Column(
-      children: [
-        SliderTheme(
-          data: SliderTheme.of(context).copyWith(
-            trackHeight: 2.5,
-            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-          ),
-          child: Slider(
-            value: enabled ? posMs : 0,
-            min: 0,
-            max: durMs > 0 ? durMs : 1,
-            onChanged: enabled
-                ? (v) => setState(
-                    () => _position = Duration(milliseconds: v.toInt()))
-                : null,
-            onChangeEnd: enabled
-                ? (v) => _seek(Duration(milliseconds: v.toInt()))
-                : null,
-          ),
-        ),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text(_fmt(_position), style: const TextStyle(color: Colors.white70)),
-            Text(_fmt(_duration), style: const TextStyle(color: Colors.white70)),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _buildLoopSlider(double durMs, double aMs, double bMs) {
-    final enabled = durMs > 0;
-
-    return SliderTheme(
-      data: SliderTheme.of(context).copyWith(
-        trackHeight: 3,
-        rangeThumbShape:
-        const RoundRangeSliderThumbShape(enabledThumbRadius: 7),
-        thumbColor: Colors.amber,
-        activeTrackColor: Colors.amber,
-        inactiveTrackColor: Colors.white24,
-      ),
-      child: RangeSlider(
-        values: RangeValues(
-          enabled ? (aMs / (durMs == 0 ? 1 : durMs)) : 0.0,
-          enabled ? (bMs / (durMs == 0 ? 1 : durMs)) : 1.0,
-        ),
-        onChanged: !enabled
-            ? null
-            : (rv) {
-          final na = Duration(milliseconds: (rv.start * durMs).toInt());
-          final nb = Duration(milliseconds: (rv.end * durMs).toInt());
-          setState(() {
-            _a = na;
-            _b = nb;
-          });
-        },
-      ),
-    );
-
-  }
-
-  Widget _buildSpeedRow() {
-    return Row(
-      children: [
-        const Icon(Icons.speed, size: 18, color: Colors.white70),
-        Expanded(
-          child: Slider(
-            value: _speed,
-            min: 0.5,
-            max: 1.5,
-            divisions: 10,
-            label: '${_speed.toStringAsFixed(2)}×',
-            onChanged: (v) => _setSpeed(v),
-          ),
-        ),
-        Text('${_speed.toStringAsFixed(2)}×',
-            style: const TextStyle(color: Colors.white70)),
-      ],
-    );
-  }
-
-  Widget _buildControlsRow(bool isPlaying) {
-    final btnStyle = IconButton.styleFrom(
-      foregroundColor: Colors.white,
-      disabledForegroundColor: Colors.white24,
-      iconSize: 28,
-    );
-
-    // Styles A/B selon état de la boucle
-    final abOffBg = Colors.white10;
-    final abOnBg  = Colors.amber.shade700;
-    final abFgOff = Colors.white70;
-    final abFgOn  = Colors.black;
-
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        // Retour 5s
-        IconButton.filledTonal(
-          style: btnStyle,
-          onPressed: _duration == Duration.zero
-              ? null
-              : () => _seekRel(const Duration(seconds: -5)),
-          icon: const Icon(Icons.replay_5),
-        ),
-        const SizedBox(width: 8),
-
-        // Play / Pause
-        IconButton.filled(
-          style: btnStyle,
-          onPressed: _duration == Duration.zero ? null : _playPause,
-          icon: Icon(isPlaying ? Icons.pause : Icons.play_arrow),
-        ),
-        const SizedBox(width: 8),
-
-        // Avance 5s
-        IconButton.filledTonal(
-          style: btnStyle,
-          onPressed: _duration == Duration.zero
-              ? null
-              : () => _seekRel(const Duration(seconds: 5)),
-          icon: const Icon(Icons.forward_5),
-        ),
-        const SizedBox(width: 12),
-
-        // Bouton A (pose A = position)
-        FilledButton.tonal(
-          style: FilledButton.styleFrom(
-            backgroundColor: _loopEnabled ? abOnBg : abOffBg,
-            foregroundColor: _loopEnabled ? abFgOn : abFgOff,
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          ),
-          onPressed: _duration == Duration.zero ? null : _markA,
-          child: const Text('A'),
-        ),
-        const SizedBox(width: 8),
-
-        // Bouton B (pose B = now, A = B-4s, active boucle)
-        FilledButton.tonal(
-          style: FilledButton.styleFrom(
-            backgroundColor: _loopEnabled ? abOnBg : abOffBg,
-            foregroundColor: _loopEnabled ? abFgOn : abFgOff,
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          ),
-          onPressed: _duration == Duration.zero ? null : _markBAndAutoLoop,
-          child: const Text('B'),
-        ),
-        const SizedBox(width: 12),
-
-        // Toggle boucle (🔁) on/off sans perdre A/B
-        IconButton(
-          tooltip: _loopEnabled ? 'Boucle ON' : 'Boucle OFF',
-          onPressed: (_a != null && _b != null) ? _toggleLoop : null,
-          icon: Icon(
-            Icons.repeat,
-            color: _loopEnabled ? Colors.amber : Colors.white70,
-          ),
-        ),
-
-        // Effacer A/B
-        IconButton(
-          tooltip: 'Effacer A/B',
-          onPressed: (_a != null || _b != null) ? _clearLoop : null,
-          icon: const Icon(Icons.close),
-        ),
-      ],
     );
   }
 }
