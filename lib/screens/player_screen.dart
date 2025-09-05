@@ -194,22 +194,39 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // ------------------ Boucle A/B ------------------
   void _markA() {
     if (_duration == Duration.zero) return;
-    setState(() => _a = _position);
+
+    setState(() {
+      _a = _position;
+      // si B existe déjà et que B > A → active la boucle
+      if (_b != null && _b! > _a!) {
+        _loopEnabled = true;
+      }
+    });
   }
 
   void _markBAndAutoLoop() {
     if (_duration == Duration.zero) return;
 
     final b = _position;
-    // calcule A = B - 4s, borné à 0
-    final aCandidate = b - _kQuickGap;
-    final a = _clampDur(aCandidate, Duration.zero, _duration);
 
-    setState(() {
-      _a = a;
-      _b = b;
-      _loopEnabled = true; // active la boucle immédiatement
-    });
+    if (_a == null) {
+      // si A n’existe pas → A = B – 4s
+      final aCandidate = b - _kQuickGap;
+      final a = _clampDur(aCandidate, Duration.zero, _duration);
+      setState(() {
+        _a = a;
+        _b = b;
+        _loopEnabled = true; // active la boucle
+      });
+    } else {
+      // si A existe déjà
+      setState(() {
+        _b = b;
+        if (_b! > _a!) {
+          _loopEnabled = true;
+        }
+      });
+    }
   }
 
   void _toggleLoop() {
