@@ -1,141 +1,150 @@
+// lib/screens/player_screen.dart
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:just_audio/just_audio.dart';
-import 'package:path/path.dart' as p;
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:video_player/video_player.dart';
+import 'package:just_audio/just_audio.dart';
+
+// --- helpers ---
+Duration _clampDur(Duration d, Duration min, Duration max) {
+  if (d < min) return min;
+  if (d > max) return max;
+  return d;
+}
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key});
+
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // ----------- Session / prefs -----------
-  SharedPreferences? _prefs;
-  static const _kSessionKey = 'player_session_v1';
-
-  // ----------- Média -----------
-  String? _mediaPath; // chemin du fichier chargé
+  // Media
+  String? _path;
   bool _isVideo = false;
+
+  // Players
   VideoPlayerController? _video;
   final AudioPlayer _audio = AudioPlayer();
+  StreamSubscription<Duration>? _audioPosSub;
 
-  // ----------- Transport -----------
+  // Durations
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
-  bool get _isPlaying => _isVideo ? (_video?.value.isPlaying ?? false) : _audio.playing;
 
-  // ----------- Boucle A/B -----------
+  // Loop A/B
   Duration? _a;
   Duration? _b;
-  bool _loop = false;
+  bool _loopEnabled = false;
 
-  // Écart par défaut pour la boucle rapide (4 s)
-  static const int _kQuickLoopMs = 4000;
+  // Speed
+  double _speed = 1.0;
 
-  // ----------- Vitesse -----------
-  double _speed = 1.0; // 0.25→2.0
-
-  // ----------- Ticker UI -----------
+  // Ticker pour la boucle (vidéo)
   Timer? _ticker;
 
   @override
   void initState() {
     super.initState();
-    _restoreSession();
     _startTicker();
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
-    _video?.removeListener(_onVideoTick);
-    _video?.dispose();
+    _audioPosSub?.cancel();
     _audio.dispose();
+    _video?.dispose();
     super.dispose();
   }
 
-  // -------------------- Utils temps --------------------
-  String _fmt(Duration d) {
-    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return '$m:$s';
-  }
-
-  Duration _clampDur(Duration d, Duration min, Duration max) {
-    if (d < min) return min;
-    if (d > max) return max;
-    return d;
-  }
-
-  // -------------------- Ouverture média --------------------
+  // --- Chargement d’un fichier ---
   Future<void> _pickFile() async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: const [
-        // vidéo
-        'mp4','mov','m4v','webm','mkv',
-        // audio
-        'mp3','m4a','aac','wav','flac','ogg'
-      ],
+      allowedExtensions: ['mp4', 'mov', 'm4v', 'mp3', 'wav', 'aac', 'm4a'],
     );
     if (res == null || res.files.isEmpty) return;
-    final path = res.files.single.path;
-    if (path == null) return;
-    await _open(path);
+
+    final p = res.files.single.path!;
+    _path = p;
+    _isVideo = _isVideoExt(p);
+
+    await _loadMedia();
   }
 
-  Future<void> _open(String path) async {
-    // stop précédent
-    await _stop();
+  bool _isVideoExt(String p) {
+    final lower = p.toLowerCase();
+    return lower.endsWith('.mp4') ||
+        lower.endsWith('.mov') ||
+        lower.endsWith('.m4v') ||
+        lower.endsWith('.webm');
+  }
 
-    _mediaPath = path;
-    _isVideo = _isLikelyVideo(path);
+  Future<void> _loadMedia() async {
+    _ticker?.cancel();
+    _audioPosSub?.cancel();
+    await _audio.stop();
+    await _video?.dispose();
+    _video = null;
+
+    setState(() {
+      _duration = Duration.zero;
+      _position = Duration.zero;
+      _a = null;
+      _b = null;
+      _loopEnabled = false;
+    });
+
+    if (_path == null) return;
 
     if (_isVideo) {
-      final c = VideoPlayerController.file(File(path));
+      final c = VideoPlayerController.file(File(_path!));
       await c.initialize();
-      c.setLooping(false);
+      await c.setLooping(false);
+      await c.setPlaybackSpeed(_speed);
       _video = c;
+
+      // Durée
       _duration = c.value.duration;
-      c.addListener(_onVideoTick);
+
+      // Position listener
+      c.addListener(() {
+        final pos = c.value.position;
+        if (mounted) {
+          setState(() => _position = pos);
+        }
+      });
+
+      _startTicker();
       setState(() {});
     } else {
-      await _audio.setFilePath(path);
+      await _audio.setFilePath(_path!);
+      await _audio.setSpeed(_speed);
+      await _audio.setPitch(1.0); // tonalité inchangée
       _duration = _audio.duration ?? Duration.zero;
-      _audio.positionStream.listen((pos) async {
-        _position = pos;
-        if (_loop && _a != null && _b != null && pos >= _b!) {
-          await _audio.seek(_a!);
-        }
-        if (mounted) setState(() {});
+
+      _audioPosSub = _audio.positionStream.listen((pos) {
+        if (mounted) setState(() => _position = pos);
       });
+
+      _startTicker();
       setState(() {});
     }
-    await _applySpeed(_speed);
-    await _saveSession();
   }
 
-  bool _isLikelyVideo(String path) {
-    final ext = p.extension(path).toLowerCase();
-    const vids = ['.mp4','.mov','.m4v','.webm','.mkv'];
-    return vids.contains(ext);
-  }
-
-  // -------------------- Lecture / Seek --------------------
-  Future<void> _togglePlay() async {
+  // --- Lecture / Pause / Seek ---
+  Future<void> _playPause() async {
     if (_isVideo) {
-      if (_video == null) return;
-      if (_video!.value.isPlaying) {
-        await _video!.pause();
+      final c = _video;
+      if (c == null) return;
+      if (c.value.isPlaying) {
+        await c.pause();
       } else {
-        await _video!.play();
+        await c.play();
       }
     } else {
       if (_audio.playing) {
@@ -148,478 +157,307 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _seek(Duration d) async {
-    if (_duration == Duration.zero) return;
     d = _clampDur(d, Duration.zero, _duration);
     if (_isVideo) {
       await _video?.seekTo(d);
     } else {
       await _audio.seek(d);
     }
-    _position = d;
-    setState(() {});
   }
 
-  Future<void> _seekRel(Duration delta) => _seek(_position + delta);
-
-  Future<void> _stop() async {
+  // --- Speed ---
+  Future<void> _setSpeed(double s) async {
+    _speed = s;
     if (_isVideo) {
-      await _video?.pause();
-      _video?.removeListener(_onVideoTick);
-      await _video?.dispose();
-      _video = null;
+      await _video?.setPlaybackSpeed(s);
     } else {
-      await _audio.stop();
+      await _audio.setPitch(1.0);
+      await _audio.setSpeed(s);
     }
-    _position = Duration.zero;
-    _duration = Duration.zero;
-    _a = null;
-    _b = null;
-    _loop = false;
     setState(() {});
   }
 
-  // -------------------- Vitesse --------------------
-  Future<void> _applySpeed(double v) async {
-    _speed = v;
-    if (_isVideo) {
-      await _video?.setPlaybackSpeed(v); // pas de pitch-preserving sur video_player
-    } else {
-      await _audio.setSpeed(v);          // just_audio conserve le pitch sur Android
-      try { await _audio.setPitch(1.0); } catch (_) {}
-    }
-    setState(() {});
-    await _saveSession();
-  }
-
-  // -------------------- Boucle A/B --------------------
-  void _quickLoopAroundCursor() {
-    if (_duration == Duration.zero) return;
-    final half = Duration(milliseconds: _kQuickLoopMs ~/ 2);
-    var a = _position - half;
-    var b = _position + half;
-    a = _clampDur(a, Duration.zero, _duration);
-    b = _clampDur(b, Duration.zero, _duration);
-    if (b <= a) b = _clampDur(a + const Duration(milliseconds: _kQuickLoopMs), Duration.zero, _duration);
-    setState(() { _a = a; _b = b; _loop = true; });
-  }
-
-  Future<void> _nudgeA(int ms) async {
-    if (_a == null) return;
-    final nd = _clampDur(_a! + Duration(milliseconds: ms), Duration.zero, _b ?? _duration);
-    setState(() => _a = nd);
-  }
-
-  Future<void> _nudgeB(int ms) async {
-    if (_b == null) return;
-    final nd = _clampDur(_b! + Duration(milliseconds: ms), _a ?? Duration.zero, _duration);
-    setState(() => _b = nd);
-  }
-
-  void _toggleLoop() {
-    if (_loop) {
-      setState(() => _loop = false);
-    } else {
-      if (_a == null || _b == null || _b! <= _a!) {
-        _quickLoopAroundCursor();
-      } else {
-        setState(() => _loop = true);
-      }
-    }
-  }
-
-  // -------------------- Ticker / callbacks --------------------
-  void _onVideoTick() {
-    final v = _video;
-    if (v == null) return;
-    _position = v.value.position;
-    if (_loop && _a != null && _b != null && _position >= _b!) {
-      v.seekTo(_a!);
-    }
-    if (mounted) setState(() {});
-  }
-
+  // --- Ticker: gère la boucle A/B ---
   void _startTicker() {
     _ticker?.cancel();
-    _ticker = Timer.periodic(const Duration(milliseconds: 60), (_) {
-      if (_isVideo) {
-        // position déjà suivie par _onVideoTick
-      } else {
-        // audio -> positionStream déjà branché
+    _ticker = Timer.periodic(const Duration(milliseconds: 120), (_) async {
+      if (!_loopEnabled) return;
+      if (_a == null || _b == null) return;
+      final a = _a!;
+      final b = _b!;
+      if (b <= a) return;
+
+      final pos = _position;
+      // Si on dépasse B de ~60ms, on revient à A
+      if (pos >= b - const Duration(milliseconds: 60)) {
+        await _seek(a);
+        if (_isVideo) {
+          if (!(_video?.value.isPlaying ?? false)) {
+            await _video?.play();
+          }
+        } else {
+          if (!_audio.playing) await _audio.play();
+        }
       }
-      if (mounted) setState(() {});
     });
   }
 
-  // -------------------- Session --------------------
-  Future<void> _restoreSession() async {
-    _prefs ??= await SharedPreferences.getInstance();
-    final s = _prefs!.getString(_kSessionKey);
-    if (s == null) return;
-    final parts = s.split('|'); // path|speed
-    if (parts.isNotEmpty && parts[0].isNotEmpty) {
-      final path = parts[0];
-      if (File(path).existsSync()) {
-        await _open(path);
-      }
-    }
-    if (parts.length > 1) {
-      final sp = double.tryParse(parts[1]);
-      if (sp != null) await _applySpeed(sp);
-    }
+  // --- Helpers format ---
+  String _fmt(Duration d) {
+    final s = d.inSeconds;
+    final m = s ~/ 60;
+    final r = s % 60;
+    return '${m.toString().padLeft(2, '0')}:${r.toString().padLeft(2, '0')}';
   }
 
-  Future<void> _saveSession() async {
-    _prefs ??= await SharedPreferences.getInstance();
-    final path = _mediaPath ?? '';
-    await _prefs!.setString(_kSessionKey, '$path|$_speed');
-  }
-
-  // -------------------- Timeline --------------------
-  static const double _tlHeight = 36;
-  static const double _handleW = 14;
-  static const double _playheadW = 2;
-
-  double _xFromDur(Duration d, double width) {
-    if (_duration == Duration.zero) return 0;
-    final r = d.inMilliseconds / _duration.inMilliseconds;
-    return (r.clamp(0.0, 1.0)) * width;
-  }
-
-  Duration _durFromX(double x, double width) {
-    if (width <= 0 || _duration == Duration.zero) return Duration.zero;
-    final r = (x / width).clamp(0.0, 1.0);
-    final ms = (r * _duration.inMilliseconds).round();
-    return Duration(milliseconds: ms);
-  }
-
-  Widget _handle(Color color) => Container(
-    width: _handleW,
-    height: _tlHeight,
-    decoration: BoxDecoration(
-      color: color,
-      borderRadius: BorderRadius.circular(3),
-    ),
-  );
-
-  Widget _timeline(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-
-    return LayoutBuilder(builder: (context, c) {
-      final w = c.maxWidth;
-      final aX = _a != null ? _xFromDur(_a!, w) : null;
-      final bX = _b != null ? _xFromDur(_b!, w) : null;
-      final pX = _xFromDur(_position, w);
-
-      return SizedBox(
-        height: _tlHeight + 22,
-        child: Column(
-          children: [
-            SizedBox(
-              height: _tlHeight,
-              child: Stack(
-                children: [
-                  // fond
-                  Positioned.fill(
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: Colors.grey.shade700,
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                    ),
-                  ),
-
-                  // zone de boucle
-                  if (aX != null && bX != null && aX < bX)
-                    Positioned(
-                      left: aX,
-                      width: (bX - aX).clamp(0, w),
-                      top: 0,
-                      bottom: 0,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: cs.primary.withOpacity(0.25),
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                      ),
-                    ),
-
-                  // poignée A
-                  if (aX != null)
-                    Positioned(
-                      left: (aX - _handleW / 2).clamp(0, math.max(0, w - _handleW)),
-                      top: 0,
-                      bottom: 0,
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.translucent,
-                        onHorizontalDragUpdate: (d) {
-                          final nx = (aX + d.delta.dx).clamp(0.0, w);
-                          final nd = _durFromX(nx, w);
-                          if (_b != null && nd > _b!) return;
-                          setState(() => _a = nd);
-                        },
-                        onDoubleTap: () => setState(() => _a = null),
-                        child: _handle(Colors.orange),
-                      ),
-                    ),
-
-                  // poignée B
-                  if (bX != null)
-                    Positioned(
-                      left: (bX - _handleW / 2).clamp(0, math.max(0, w - _handleW)),
-                      top: 0,
-                      bottom: 0,
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.translucent,
-                        onHorizontalDragUpdate: (d) {
-                          final nx = (bX + d.delta.dx).clamp(0.0, w);
-                          final nd = _durFromX(nx, w);
-                          if (_a != null && nd < _a!) return;
-                          setState(() => _b = nd);
-                        },
-                        onDoubleTap: () => setState(() => _b = null),
-                        child: _handle(Colors.orange),
-                      ),
-                    ),
-
-                  // playhead
-                  Positioned(
-                    left: (pX - _playheadW / 2).clamp(0, math.max(0, w - _playheadW)),
-                    top: 0,
-                    bottom: 0,
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.translucent,
-                      onHorizontalDragUpdate: (d) {
-                        final nx = (pX + d.delta.dx).clamp(0.0, w);
-                        final nd = _durFromX(nx, w);
-                        _seek(nd);
-                      },
-                      onTapDown: (t) {
-                        final nd = _durFromX(t.localPosition.dx, w);
-                        _seek(nd);
-                      },
-                      child: Container(width: _playheadW, color: Colors.white),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            // repères
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(_fmt(Duration.zero), style: const TextStyle(fontSize: 12)),
-                  Text(_fmt(_position), style: const TextStyle(fontSize: 12)),
-                  Text(_fmt(_duration), style: const TextStyle(fontSize: 12)),
-                ],
-              ),
-            ),
-          ],
-        ),
-      );
-    });
-  }
-
-  // -------------------- UI --------------------
+  // --- UI ---
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final ready = _duration > Duration.zero;
+    final isPlaying =
+    _isVideo ? (_video?.value.isPlaying ?? false) : _audio.playing;
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Lecture'),
-        actions: [
-          IconButton(
-            tooltip: 'Ouvrir',
-            onPressed: _pickFile,
-            icon: const Icon(Icons.folder_open),
-          ),
-          if (_mediaPath != null)
-            Padding(
-              padding: const EdgeInsets.only(right: 12),
-              child: Center(
-                child: Text(
-                  p.basename(_mediaPath!),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 12),
-                ),
-              ),
-            ),
-        ],
-      ),
+      backgroundColor: Colors.black,
       body: SafeArea(
-        child: Column(
+        child: Stack(
           children: [
-            // viewport vidéo (ou pictogramme audio)
-            AspectRatio(
-              aspectRatio: _isVideo ? (_video?.value.aspectRatio ?? 16/9) : 16/9,
-              child: Container(
-                color: Colors.black,
-                child: _isVideo
-                    ? (_video != null && _video!.value.isInitialized
-                    ? VideoPlayer(_video!)
-                    : const Center(child: CircularProgressIndicator()))
-                    : const Center(child: Icon(Icons.music_note, size: 72, color: Colors.white)),
-              ),
+            // Zone média
+            Positioned.fill(
+              child: _buildMedia(),
             ),
 
-            // timeline
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              child: _timeline(context),
+            // Panneau bas semi-transparent
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: _buildBottomPanel(isPlaying),
             ),
 
-            // seek rapides
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  _SeekBtn(label: '≪ 2s', onTap: () => _seekRel(const Duration(seconds: -2))),
-                  _SeekBtn(label: '≪ 10s', onTap: () => _seekRel(const Duration(seconds: -10))),
-                  _SeekBtn(label: '10s ≫', onTap: () => _seekRel(const Duration(seconds: 10))),
-                  _SeekBtn(label: '2s ≫', onTap: () => _seekRel(const Duration(seconds: 2))),
-                ],
-              ),
-            ),
-
-            // A/B + loop
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  FilledButton(
-                    onPressed: ready ? () => setState(() => _a = _position) : null,
-                    child: Text("A ${_a == null ? '--:--' : _fmt(_a!)}"),
-                  ),
-                  const SizedBox(width: 10),
-                  Row(
-                    children: [
-                      _Mini(label: 'A-0.1', onTap: () => _nudgeA(-100)),
-                      const SizedBox(width: 6),
-                      _Mini(label: 'A+0.1', onTap: () => _nudgeA(100)),
-                      const SizedBox(width: 6),
-                      _Mini(label: 'A-1', onTap: () => _nudgeA(-1000)),
-                      const SizedBox(width: 6),
-                      _Mini(label: 'A+1', onTap: () => _nudgeA(1000)),
-                    ],
-                  ),
-                  const SizedBox(width: 10),
-                  FilledButton(
-                    onPressed: ready ? () => setState(() => _b = _position) : null,
-                    child: Text("B ${_b == null ? '--:--' : _fmt(_b!)}"),
-                  ),
-                  const SizedBox(width: 10),
-                  Row(
-                    children: [
-                      _Mini(label: 'B-0.1', onTap: () => _nudgeB(-100)),
-                      const SizedBox(width: 6),
-                      _Mini(label: 'B+0.1', onTap: () => _nudgeB(100)),
-                      const SizedBox(width: 6),
-                      _Mini(label: 'B-1', onTap: () => _nudgeB(-1000)),
-                      const SizedBox(width: 6),
-                      _Mini(label: 'B+1', onTap: () => _nudgeB(1000)),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-
-            // transport + loop + quick
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                IconButton(
-                  tooltip: 'Aller à A',
-                  onPressed: (_a != null && ready) ? () => _seek(_a!) : null,
-                  icon: const Icon(Icons.skip_previous),
-                ),
-                IconButton.filled(
-                  onPressed: ready ? _togglePlay : null,
-                  icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
-                ),
-                IconButton(
-                  tooltip: 'Aller à B',
-                  onPressed: (_b != null && ready) ? () => _seek(_b!) : null,
-                  icon: const Icon(Icons.skip_next),
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  tooltip: _loop ? 'Boucle ON' : 'Boucle OFF',
-                  onPressed: ready ? _toggleLoop : null,
-                  icon: Icon(Icons.loop, color: _loop ? cs.primary : null),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton.icon(
-                  onPressed: ready ? _quickLoopAroundCursor : null,
-                  icon: const Icon(Icons.auto_fix_high),
-                  label: const Text('Boucle rapide'),
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  tooltip: 'Effacer A/B',
-                  onPressed: (_a != null || _b != null)
-                      ? () => setState(() { _a = null; _b = null; _loop = false; })
-                      : null,
-                  icon: const Icon(Icons.close),
-                ),
-              ],
-            ),
-
-            // vitesse
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Row(
-                children: [
-                  const Icon(Icons.speed),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Slider(
-                      value: _speed.clamp(0.25, 2.0),
-                      min: 0.25,
-                      max: 2.0,
-                      onChanged: ready ? (v) => _applySpeed(v) : null,
+            // Bouton "Ouvrir" si rien chargé
+            if (_path == null)
+              Positioned.fill(
+                child: Center(
+                  child: FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Colors.white.withOpacity(0.1),
+                      padding:
+                      const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
                     ),
+                    onPressed: _pickFile,
+                    child: const Text('Ouvrir un fichier',
+                        style: TextStyle(color: Colors.white)),
                   ),
-                  SizedBox(
-                    width: 60,
-                    child: Text('${_speed.toStringAsFixed(2)}x', textAlign: TextAlign.right),
-                  ),
-                ],
+                ),
               ),
-            ),
           ],
         ),
       ),
     );
   }
-}
 
-// ---- Petits widgets utilitaires ----
-class _SeekBtn extends StatelessWidget {
-  final String label;
-  final VoidCallback onTap;
-  const _SeekBtn({required this.label, required this.onTap});
-  @override
-  Widget build(BuildContext context) {
-    return OutlinedButton(onPressed: onTap, child: Text(label));
+  Widget _buildMedia() {
+    if (_isVideo && _video != null && _video!.value.isInitialized) {
+      final ar = _video!.value.aspectRatio;
+      return Center(
+        child: AspectRatio(
+          aspectRatio: ar == 0 ? 16 / 9 : ar,
+          child: VideoPlayer(_video!),
+        ),
+      );
+    }
+    // Audio ou rien : fond neutre
+    return Container(color: Colors.black);
   }
-}
 
-class _Mini extends StatelessWidget {
-  final String label;
-  final VoidCallback onTap;
-  const _Mini({required this.label, required this.onTap});
-  @override
-  Widget build(BuildContext context) {
-    return OutlinedButton(
-      onPressed: onTap,
-      style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6)),
-      child: Text(label, style: const TextStyle(fontSize: 12)),
+  Widget _buildBottomPanel(bool isPlaying) {
+    final durMs = _duration.inMilliseconds.toDouble().clamp(0.0, double.infinity);
+    final posMs = _position.inMilliseconds.toDouble().clamp(0.0, durMs);
+
+    final aMs = (_a?.inMilliseconds.toDouble() ?? 0.0).clamp(0.0, durMs);
+    final bMs =
+    (_b?.inMilliseconds.toDouble() ?? (durMs > 0 ? durMs : 0.0)).clamp(0.0, durMs);
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment(0, -1),
+          end: Alignment(0, 1),
+          colors: [Colors.transparent, Color.fromARGB(200, 0, 0, 0)],
+        ),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Barre de progression fine (position seule)
+          _buildPositionSlider(durMs, posMs),
+
+          const SizedBox(height: 8),
+
+          // Slider A/B (poignées de boucle)
+          _buildLoopSlider(durMs, aMs, bMs),
+
+          const SizedBox(height: 8),
+
+          // Vitesse
+          _buildSpeedRow(),
+
+          const SizedBox(height: 8),
+
+          // Contrôles
+          _buildControlsRow(isPlaying),
+        ],
+      ),
+    );
+  }
+
+  // --- Widgets détaillés ---
+
+  Widget _buildPositionSlider(double durMs, double posMs) {
+    final enabled = durMs > 0;
+    return Column(
+      children: [
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            trackHeight: 2.5,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+          ),
+          child: Slider(
+            value: enabled ? posMs : 0,
+            min: 0,
+            max: durMs > 0 ? durMs : 1,
+            onChanged: enabled
+                ? (v) => setState(() => _position = Duration(milliseconds: v.toInt()))
+                : null,
+            onChangeEnd: enabled ? (v) => _seek(Duration(milliseconds: v.toInt())) : null,
+          ),
+        ),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(_fmt(_position), style: const TextStyle(color: Colors.white70)),
+            Text(_fmt(_duration), style: const TextStyle(color: Colors.white70)),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLoopSlider(double durMs, double aMs, double bMs) {
+    final enabled = durMs > 0;
+
+    return Column(
+      children: [
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            trackHeight: 3,
+            rangeThumbShape: const RoundRangeSliderThumbShape(enabledThumbRadius: 7),
+            thumbColor: Colors.amber,
+            activeTrackColor: Colors.amber,
+            inactiveTrackColor: Colors.white24,
+          ),
+          child: RangeSlider(
+            values: RangeValues(
+              enabled ? aMs / (durMs == 0 ? 1 : durMs) : 0.0,
+              enabled ? bMs / (durMs == 0 ? 1 : durMs) : 1.0,
+            ),
+            onChanged: !enabled
+                ? null
+                : (rv) {
+              final na = Duration(milliseconds: (rv.start * durMs).toInt());
+              final nb = Duration(milliseconds: (rv.end * durMs).toInt());
+              setState(() {
+                _a = na;
+                _b = nb;
+              });
+            },
+          ),
+        ),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text('A: ${_a == null ? '--:--' : _fmt(_a!)}',
+                style: const TextStyle(color: Colors.white70)),
+            Text('B: ${_b == null ? '--:--' : _fmt(_b!)}',
+                style: const TextStyle(color: Colors.white70)),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSpeedRow() {
+    return Row(
+      children: [
+        const Icon(Icons.speed, size: 18, color: Colors.white70),
+        Expanded(
+          child: Slider(
+            value: _speed,
+            min: 0.5,
+            max: 1.5,
+            divisions: 10,
+            label: '${_speed.toStringAsFixed(2)}×',
+            onChanged: (v) => _setSpeed(v),
+          ),
+        ),
+        Text('${_speed.toStringAsFixed(2)}×',
+            style: const TextStyle(color: Colors.white70)),
+      ],
+    );
+  }
+
+  Widget _buildControlsRow(bool isPlaying) {
+    final btnStyle = IconButton.styleFrom(
+      foregroundColor: Colors.white,
+      disabledForegroundColor: Colors.white24,
+      iconSize: 28,
+    );
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        IconButton.filledTonal(
+          style: btnStyle,
+          onPressed: _duration == Duration.zero
+              ? null
+              : () {
+            final back = _position - const Duration(seconds: 5);
+            _seek(back);
+          },
+          icon: const Icon(Icons.replay_5),
+        ),
+        const SizedBox(width: 8),
+        IconButton.filled(
+          style: btnStyle,
+          onPressed: _duration == Duration.zero ? null : _playPause,
+          icon: Icon(isPlaying ? Icons.pause : Icons.play_arrow),
+        ),
+        const SizedBox(width: 8),
+        IconButton.filledTonal(
+          style: btnStyle,
+          onPressed: _duration == Duration.zero
+              ? null
+              : () {
+            final fwd = _position + const Duration(seconds: 5);
+            _seek(fwd);
+          },
+          icon: const Icon(Icons.forward_5),
+        ),
+        const SizedBox(width: 16),
+        FilterChip(
+          selectedColor: Colors.amber.shade700,
+          checkmarkColor: Colors.white,
+          label: const Text('A↻B', style: TextStyle(color: Colors.white)),
+          selected: _loopEnabled,
+          onSelected: (v) => setState(() => _loopEnabled = v),
+        ),
+        const SizedBox(width: 12),
+        OutlinedButton(
+          onPressed: _pickFile,
+          child: const Text('Ouvrir'),
+        ),
+      ],
     );
   }
 }
