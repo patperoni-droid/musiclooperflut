@@ -2,10 +2,10 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:video_player/video_player.dart';
+import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:video_player/video_player.dart';
 
 // --- helpers ---
 Duration _clampDur(Duration d, Duration min, Duration max) {
@@ -43,7 +43,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // Speed
   double _speed = 1.0;
 
-  // Ticker pour la boucle (vidéo)
+  // Ticker pour gérer le rebouclage
   Timer? _ticker;
 
   @override
@@ -57,22 +57,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _ticker?.cancel();
     _audioPosSub?.cancel();
     _audio.dispose();
+    _video?.removeListener(_onVideoTick);
     _video?.dispose();
     super.dispose();
   }
 
-  // --- Chargement d’un fichier ---
+  // ------------------ Fichier ------------------
   Future<void> _pickFile() async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['mp4', 'mov', 'm4v', 'mp3', 'wav', 'aac', 'm4a'],
+      allowedExtensions: [
+        // vidéo
+        'mp4', 'mov', 'm4v', 'webm',
+        // audio
+        'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg',
+      ],
     );
     if (res == null || res.files.isEmpty) return;
+    final p = res.files.single.path;
+    if (p == null) return;
 
-    final p = res.files.single.path!;
     _path = p;
     _isVideo = _isVideoExt(p);
-
     await _loadMedia();
   }
 
@@ -85,9 +91,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _loadMedia() async {
+    // Stop & reset
     _ticker?.cancel();
     _audioPosSub?.cancel();
     await _audio.stop();
+    _video?.removeListener(_onVideoTick);
+    await _video?.pause();
     await _video?.dispose();
     _video = null;
 
@@ -108,27 +117,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await c.setPlaybackSpeed(_speed);
       _video = c;
 
-      // Durée
       _duration = c.value.duration;
-
-      // Position listener
-      c.addListener(() {
-        final pos = c.value.position;
-        if (mounted) {
-          setState(() => _position = pos);
-        }
-      });
+      c.addListener(_onVideoTick);
 
       _startTicker();
       setState(() {});
     } else {
       await _audio.setFilePath(_path!);
       await _audio.setSpeed(_speed);
-      await _audio.setPitch(1.0); // tonalité inchangée
+      // Essayons de forcer le pitch neutre (selon plateforme)
+      try {
+        await _audio.setPitch(1.0);
+      } catch (_) {}
       _duration = _audio.duration ?? Duration.zero;
 
       _audioPosSub = _audio.positionStream.listen((pos) {
-        if (mounted) setState(() => _position = pos);
+        if (!mounted) return;
+        setState(() => _position = pos);
       });
 
       _startTicker();
@@ -136,7 +141,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  // --- Lecture / Pause / Seek ---
+  // ------------------ Lecture / Seek ------------------
   Future<void> _playPause() async {
     if (_isVideo) {
       final c = _video;
@@ -157,39 +162,73 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _seek(Duration d) async {
+    if (_duration == Duration.zero) return;
     d = _clampDur(d, Duration.zero, _duration);
     if (_isVideo) {
       await _video?.seekTo(d);
     } else {
       await _audio.seek(d);
     }
+    setState(() => _position = d);
   }
 
-  // --- Speed ---
+  Future<void> _seekRel(Duration delta) => _seek(_position + delta);
+
+  // ------------------ Vitesse ------------------
   Future<void> _setSpeed(double s) async {
     _speed = s;
     if (_isVideo) {
       await _video?.setPlaybackSpeed(s);
     } else {
-      await _audio.setPitch(1.0);
+      try {
+        await _audio.setPitch(1.0);
+      } catch (_) {}
       await _audio.setSpeed(s);
     }
     setState(() {});
   }
 
-  // --- Ticker: gère la boucle A/B ---
+  // ------------------ Boucle A/B ------------------
+  void _toggleLoop() {
+    if (_a == null || _b == null || _b! <= _a!) {
+      // Si A/B pas définis correctement, crée une petite fenêtre autour du curseur (4s)
+      const gap = Duration(seconds: 4);
+      final half = Duration(milliseconds: gap.inMilliseconds ~/ 2);
+      final a = _clampDur(_position - half, Duration.zero, _duration);
+      var b = _clampDur(_position + half, Duration.zero, _duration);
+      if (b <= a) {
+        b = _clampDur(a + gap, Duration.zero, _duration);
+      }
+      setState(() {
+        _a = a;
+        _b = b;
+        _loopEnabled = true;
+      });
+    } else {
+      setState(() => _loopEnabled = !_loopEnabled);
+    }
+  }
+
+  // ------------------ Ticker / callbacks ------------------
+  void _onVideoTick() {
+    final v = _video;
+    if (v == null) return;
+    final pos = v.value.position;
+    if (!mounted) return;
+    setState(() => _position = pos);
+  }
+
   void _startTicker() {
     _ticker?.cancel();
-    _ticker = Timer.periodic(const Duration(milliseconds: 120), (_) async {
-      if (!_loopEnabled) return;
-      if (_a == null || _b == null) return;
+    _ticker = Timer.periodic(const Duration(milliseconds: 80), (_) async {
+      if (!_loopEnabled || _a == null || _b == null) return;
       final a = _a!;
       final b = _b!;
       if (b <= a) return;
 
       final pos = _position;
-      // Si on dépasse B de ~60ms, on revient à A
-      if (pos >= b - const Duration(milliseconds: 60)) {
+      // Si on atteint B, on repart à A
+      if (pos >= b - const Duration(milliseconds: 40)) {
         await _seek(a);
         if (_isVideo) {
           if (!(_video?.value.isPlaying ?? false)) {
@@ -202,7 +241,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
   }
 
-  // --- Helpers format ---
+  // ------------------ UI helpers ------------------
   String _fmt(Duration d) {
     final s = d.inSeconds;
     final m = s ~/ 60;
@@ -210,7 +249,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return '${m.toString().padLeft(2, '0')}:${r.toString().padLeft(2, '0')}';
   }
 
-  // --- UI ---
   @override
   Widget build(BuildContext context) {
     final isPlaying =
@@ -218,38 +256,30 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     return Scaffold(
       backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        title: const Text('MusicLooper'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.folder_open),
+            tooltip: 'Ouvrir un fichier',
+            onPressed: _pickFile,
+          ),
+        ],
+      ),
       body: SafeArea(
         child: Stack(
           children: [
-            // Zone média
-            Positioned.fill(
-              child: _buildMedia(),
-            ),
+            // Média (vidéo plein écran, sinon fond noir)
+            Positioned.fill(child: _buildMedia()),
 
-            // Panneau bas semi-transparent
+            // Panneau bas (contrôles minimalistes)
             Positioned(
               left: 0,
               right: 0,
               bottom: 0,
               child: _buildBottomPanel(isPlaying),
             ),
-
-            // Bouton "Ouvrir" si rien chargé
-            if (_path == null)
-              Positioned.fill(
-                child: Center(
-                  child: FilledButton(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: Colors.white.withOpacity(0.1),
-                      padding:
-                      const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
-                    ),
-                    onPressed: _pickFile,
-                    child: const Text('Ouvrir un fichier',
-                        style: TextStyle(color: Colors.white)),
-                  ),
-                ),
-              ),
           ],
         ),
       ),
@@ -266,17 +296,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       );
     }
-    // Audio ou rien : fond neutre
     return Container(color: Colors.black);
   }
 
   Widget _buildBottomPanel(bool isPlaying) {
-    final durMs = _duration.inMilliseconds.toDouble().clamp(0.0, double.infinity);
+    final durMs =
+    _duration.inMilliseconds.toDouble().clamp(0.0, double.infinity);
     final posMs = _position.inMilliseconds.toDouble().clamp(0.0, durMs);
-
-    final aMs = (_a?.inMilliseconds.toDouble() ?? 0.0).clamp(0.0, durMs);
+    final aMs =
+    (_a?.inMilliseconds.toDouble() ?? 0.0).clamp(0.0, durMs);
     final bMs =
-    (_b?.inMilliseconds.toDouble() ?? (durMs > 0 ? durMs : 0.0)).clamp(0.0, durMs);
+    (_b?.inMilliseconds.toDouble() ?? (durMs > 0 ? durMs : 0.0))
+        .clamp(0.0, durMs);
 
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
@@ -284,18 +315,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
         gradient: LinearGradient(
           begin: Alignment(0, -1),
           end: Alignment(0, 1),
-          colors: [Colors.transparent, Color.fromARGB(200, 0, 0, 0)],
+          colors: [Colors.transparent, Color.fromARGB(210, 0, 0, 0)],
         ),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Barre de progression fine (position seule)
+          // Barre de progression fine (seek)
           _buildPositionSlider(durMs, posMs),
 
           const SizedBox(height: 8),
 
-          // Slider A/B (poignées de boucle)
+          // Slider A/B (poignées)
           _buildLoopSlider(durMs, aMs, bMs),
 
           const SizedBox(height: 8),
@@ -328,9 +359,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
             min: 0,
             max: durMs > 0 ? durMs : 1,
             onChanged: enabled
-                ? (v) => setState(() => _position = Duration(milliseconds: v.toInt()))
+                ? (v) => setState(
+                    () => _position = Duration(milliseconds: v.toInt()))
                 : null,
-            onChangeEnd: enabled ? (v) => _seek(Duration(milliseconds: v.toInt())) : null,
+            onChangeEnd: enabled
+                ? (v) => _seek(Duration(milliseconds: v.toInt()))
+                : null,
           ),
         ),
         Row(
@@ -352,21 +386,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
         SliderTheme(
           data: SliderTheme.of(context).copyWith(
             trackHeight: 3,
-            rangeThumbShape: const RoundRangeSliderThumbShape(enabledThumbRadius: 7),
+            rangeThumbShape:
+            const RoundRangeSliderThumbShape(enabledThumbRadius: 7),
             thumbColor: Colors.amber,
             activeTrackColor: Colors.amber,
             inactiveTrackColor: Colors.white24,
           ),
           child: RangeSlider(
             values: RangeValues(
-              enabled ? aMs / (durMs == 0 ? 1 : durMs) : 0.0,
-              enabled ? bMs / (durMs == 0 ? 1 : durMs) : 1.0,
+              enabled ? (aMs / (durMs == 0 ? 1 : durMs)) : 0.0,
+              enabled ? (bMs / (durMs == 0 ? 1 : durMs)) : 1.0,
             ),
             onChanged: !enabled
                 ? null
                 : (rv) {
-              final na = Duration(milliseconds: (rv.start * durMs).toInt());
-              final nb = Duration(milliseconds: (rv.end * durMs).toInt());
+              final na =
+              Duration(milliseconds: (rv.start * durMs).toInt());
+              final nb =
+              Duration(milliseconds: (rv.end * durMs).toInt());
               setState(() {
                 _a = na;
                 _b = nb;
@@ -421,10 +458,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           style: btnStyle,
           onPressed: _duration == Duration.zero
               ? null
-              : () {
-            final back = _position - const Duration(seconds: 5);
-            _seek(back);
-          },
+              : () => _seekRel(const Duration(seconds: -5)),
           icon: const Icon(Icons.replay_5),
         ),
         const SizedBox(width: 8),
@@ -438,10 +472,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           style: btnStyle,
           onPressed: _duration == Duration.zero
               ? null
-              : () {
-            final fwd = _position + const Duration(seconds: 5);
-            _seek(fwd);
-          },
+              : () => _seekRel(const Duration(seconds: 5)),
           icon: const Icon(Icons.forward_5),
         ),
         const SizedBox(width: 16),
@@ -451,11 +482,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
           label: const Text('A↻B', style: TextStyle(color: Colors.white)),
           selected: _loopEnabled,
           onSelected: (v) => setState(() => _loopEnabled = v),
-        ),
-        const SizedBox(width: 12),
-        OutlinedButton(
-          onPressed: _pickFile,
-          child: const Text('Ouvrir'),
         ),
       ],
     );
