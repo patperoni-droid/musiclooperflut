@@ -46,6 +46,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // Ticker pour gérer le rebouclage
   Timer? _ticker;
 
+  // Ecart par défaut pour la pose rapide de boucle via B
+  static const Duration _kQuickGap = Duration(seconds: 4);
+
   @override
   void initState() {
     super.initState();
@@ -125,7 +128,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } else {
       await _audio.setFilePath(_path!);
       await _audio.setSpeed(_speed);
-      // Essayons de forcer le pitch neutre (selon plateforme)
+      // force un pitch neutre si dispo
       try {
         await _audio.setPitch(1.0);
       } catch (_) {}
@@ -189,16 +192,34 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   // ------------------ Boucle A/B ------------------
+  void _markA() {
+    if (_duration == Duration.zero) return;
+    setState(() => _a = _position);
+  }
+
+  void _markBAndAutoLoop() {
+    if (_duration == Duration.zero) return;
+
+    final b = _position;
+    // calcule A = B - 4s, borné à 0
+    final aCandidate = b - _kQuickGap;
+    final a = _clampDur(aCandidate, Duration.zero, _duration);
+
+    setState(() {
+      _a = a;
+      _b = b;
+      _loopEnabled = true; // active la boucle immédiatement
+    });
+  }
+
   void _toggleLoop() {
+    // petit toggle pour couper/réactiver la boucle sans perdre A/B
     if (_a == null || _b == null || _b! <= _a!) {
-      // Si A/B pas définis correctement, crée une petite fenêtre autour du curseur (4s)
-      const gap = Duration(seconds: 4);
-      final half = Duration(milliseconds: gap.inMilliseconds ~/ 2);
+      // si A/B pas valides, on crée une fenêtre rapide autour du curseur
+      final half = Duration(milliseconds: _kQuickGap.inMilliseconds ~/ 2);
       final a = _clampDur(_position - half, Duration.zero, _duration);
       var b = _clampDur(_position + half, Duration.zero, _duration);
-      if (b <= a) {
-        b = _clampDur(a + gap, Duration.zero, _duration);
-      }
+      if (b <= a) b = _clampDur(a + _kQuickGap, Duration.zero, _duration);
       setState(() {
         _a = a;
         _b = b;
@@ -207,6 +228,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } else {
       setState(() => _loopEnabled = !_loopEnabled);
     }
+  }
+
+  void _clearLoop() {
+    setState(() {
+      _a = null;
+      _b = null;
+      _loopEnabled = false;
+    });
   }
 
   // ------------------ Ticker / callbacks ------------------
@@ -227,7 +256,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (b <= a) return;
 
       final pos = _position;
-      // Si on atteint B, on repart à A
       if (pos >= b - const Duration(milliseconds: 40)) {
         await _seek(a);
         if (_isVideo) {
@@ -336,7 +364,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 8),
 
-          // Contrôles
+          // Contrôles + A/B rapides
           _buildControlsRow(isPlaying),
         ],
       ),
@@ -454,6 +482,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
+        // Retour 5s
         IconButton.filledTonal(
           style: btnStyle,
           onPressed: _duration == Duration.zero
@@ -462,12 +491,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
           icon: const Icon(Icons.replay_5),
         ),
         const SizedBox(width: 8),
+
+        // Play / Pause
         IconButton.filled(
           style: btnStyle,
           onPressed: _duration == Duration.zero ? null : _playPause,
           icon: Icon(isPlaying ? Icons.pause : Icons.play_arrow),
         ),
         const SizedBox(width: 8),
+
+        // Avance 5s
         IconButton.filledTonal(
           style: btnStyle,
           onPressed: _duration == Duration.zero
@@ -475,13 +508,37 @@ class _PlayerScreenState extends State<PlayerScreen> {
               : () => _seekRel(const Duration(seconds: 5)),
           icon: const Icon(Icons.forward_5),
         ),
-        const SizedBox(width: 16),
+        const SizedBox(width: 10),
+
+        // Bouton A
+        FilledButton.tonal(
+          onPressed: _duration == Duration.zero ? null : _markA,
+          child: Text('A ${_a == null ? '' : _fmt(_a!)}'),
+        ),
+        const SizedBox(width: 8),
+
+        // Bouton B (pose B = now, A = B-4s, active boucle)
+        FilledButton.tonal(
+          onPressed: _duration == Duration.zero ? null : _markBAndAutoLoop,
+          child: Text('B ${_b == null ? '' : _fmt(_b!)}'),
+        ),
+        const SizedBox(width: 10),
+
+        // Toggle boucle
         FilterChip(
           selectedColor: Colors.amber.shade700,
           checkmarkColor: Colors.white,
           label: const Text('A↻B', style: TextStyle(color: Colors.white)),
           selected: _loopEnabled,
-          onSelected: (v) => setState(() => _loopEnabled = v),
+          onSelected: (_) => _toggleLoop(),
+        ),
+        const SizedBox(width: 6),
+
+        // Effacer A/B
+        IconButton(
+          tooltip: 'Effacer A/B',
+          onPressed: (_a != null || _b != null) ? _clearLoop : null,
+          icon: const Icon(Icons.close),
         ),
       ],
     );
