@@ -1,4 +1,3 @@
-// lib/screens/player_screen.dart
 import 'dart:async';
 import 'dart:io';
 
@@ -7,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:video_player/video_player.dart';
 import 'package:path/path.dart' as p;
+import 'package:shared_preferences/shared_preferences.dart';
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key});
@@ -18,6 +18,8 @@ class PlayerScreen extends StatefulWidget {
 class _PlayerScreenState extends State<PlayerScreen> {
   // --------- Constantes / helpers ----------
   static const Duration _kQuickGap = Duration(seconds: 4);
+  static const _kPosMsKey = 'looptrainer_session_v1.positionMs';
+  static const _kResumeFlagKey = 'looptrainer_session_v1.resumeWanted';
 
   Duration _clampDur(Duration d, Duration min, Duration max) {
     if (d < min) return min;
@@ -25,6 +27,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return d;
   }
 
+  Future<Duration> _waitForNonZeroDuration({Duration timeout = const Duration(seconds: 2)}) async {
+    final start = DateTime.now();
+    while (true) {
+      final dur = await _currentDuration();
+      if (dur > Duration.zero) return dur;
+      if (DateTime.now().difference(start) > timeout) return dur; // on sort quand même
+      await Future.delayed(const Duration(milliseconds: 50));
+    }
+  }
   String _fmt(Duration d) {
     final s = d.inSeconds;
     final mm = (s ~/ 60).toString().padLeft(2, '0');
@@ -54,16 +65,91 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // Ticker de position
   Timer? _ticker;
 
+  // --------- Session / autosave ----------
+  SharedPreferences? _prefs;
+  Timer? _autosaveTimer;
+  static const _kSessionKey = 'looptrainer_session_v1';
+
+  int _durToMs(Duration? d) => d == null ? -1 : d.inMilliseconds;
+  Duration? _msToDur(int? ms) =>
+      (ms == null || ms < 0) ? null : Duration(milliseconds: ms);
+
+  void _scheduleAutosave() {
+    _autosaveTimer?.cancel();
+    _autosaveTimer = Timer(const Duration(milliseconds: 500), _saveSession);
+  }
+
+  Future<void> _saveSession() async {
+    try {
+      final sp = _prefs ??= await SharedPreferences.getInstance();
+
+      await sp.setString('$_kSessionKey.path', _mediaPath ?? '');
+      await sp.setBool('$_kSessionKey.isVideo', _isVideo);
+      await sp.setDouble('$_kSessionKey.speed', _speed);
+
+      await sp.setInt('$_kSessionKey.aMs', _durToMs(_a));
+      await sp.setInt('$_kSessionKey.bMs', _durToMs(_b));
+      await sp.setBool('$_kSessionKey.loop', _loopEnabled);
+      await sp.setInt(_kPosMsKey, _durToMs(_position));
+// Flag pour dire qu'on souhaite reprendre à la relance (pratique si on veut désactiver plus tard)
+      await sp.setBool(_kResumeFlagKey, true);
+    } catch (_) {}
+  }
+
+  Future<void> _restoreSession() async {
+    try {
+      final sp = _prefs ??= await SharedPreferences.getInstance();
+
+      final path = sp.getString('$_kSessionKey.path');
+      final isVideo = sp.getBool('$_kSessionKey.isVideo') ?? false;
+      final posMs = sp.getInt(_kPosMsKey);
+      final wantResume = sp.getBool(_kResumeFlagKey) ?? true;
+
+      if (wantResume) {
+        final savedPos = _msToDur(posMs) ?? Duration.zero;
+        // borne la position : 0 <= pos <= (duration - 300ms) pour éviter un seek tout en fin de piste
+        final safeMax = (_duration > const Duration(milliseconds: 300))
+            ? _duration - const Duration(milliseconds: 300)
+            : Duration.zero;
+        final target = _clampDur(savedPos, Duration.zero, safeMax);
+
+        if (target > Duration.zero) {
+          await _seek(target);
+        }
+      }
+      final speed = sp.getDouble('$_kSessionKey.speed') ?? 1.0;
+      final aMs = sp.getInt('$_kSessionKey.aMs');
+      final bMs = sp.getInt('$_kSessionKey.bMs');
+      final loop = sp.getBool('$_kSessionKey.loop') ?? false;
+
+      if (path == null || path.isEmpty) return;
+      if (!File(path).existsSync()) return;
+
+      await _openMediaFromPath(path, isVideo: isVideo);
+
+      setState(() {
+        _speed = speed.clamp(0.5, 1.5);
+        _a = _msToDur(aMs);
+        _b = _msToDur(bMs);
+        _loopEnabled = loop && (_a != null && _b != null && _b! > _a!);
+      });
+
+      _applySpeedToPlayers();
+    } catch (_) {}
+  }
+
   // --------- Cycle de vie ----------
   @override
   void initState() {
     super.initState();
     _startTicker();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _restoreSession());
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
+    _autosaveTimer?.cancel();
     _video?.dispose();
     _audio.dispose();
     super.dispose();
@@ -80,10 +166,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
         setState(() {
           _position = pos;
           _duration = dur;
+          if (pos != _position || dur != _duration) {
+            setState(() {
+              _position = pos;
+              _duration = dur;
+            });
+            // Sauvegarde légère de la position (toutes les ~500 ms grâce à _scheduleAutosave)
+            _scheduleAutosave();
+          }
         });
       }
 
-      // Gestion de la boucle
       if (_loopEnabled && _a != null && _b != null && _b! > _a!) {
         if (pos >= _b!) {
           unawaited(_seek(_a!));
@@ -117,21 +210,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: [
-        // audio
         'mp3', 'm4a', 'aac', 'wav', 'ogg', 'flac',
-        // video
         'mp4', 'mov', 'mkv', 'webm'
       ],
     );
     if (res == null || res.files.single.path == null) return;
+    await _openMediaFromPath(res.files.single.path!);
+    _scheduleAutosave();
+  }
 
-    final path = res.files.single.path!;
+  Future<void> _openMediaFromPath(String path, {bool? isVideo}) async {
     final ext = p.extension(path).toLowerCase();
-
     _stop();
 
-    if (['.mp4', '.mov', '.mkv', '.webm'].contains(ext)) {
-      // Vidéo
+    final isVid = isVideo ??
+        ['.mp4', '.mov', '.mkv', '.webm'].contains(ext);
+
+    if (isVid) {
       final controller = VideoPlayerController.file(File(path));
       await controller.initialize();
       await controller.setLooping(false);
@@ -141,9 +236,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _mediaPath = path;
         _video = controller;
       });
+      _scheduleAutosave(); // << ajoute ici pour vidéo
+      await controller.play();
       await controller.play();
     } else {
-      // Audio
       await _audio.setFilePath(path);
       await _audio.setLoopMode(LoopMode.off);
       await _audio.setSpeed(_speed);
@@ -151,15 +247,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _isVideo = false;
         _mediaPath = path;
       });
+      setState(() {
+        _isVideo = false;
+        _mediaPath = path;
+      });
+      _scheduleAutosave(); // << ajoute ici pour audio
       await _audio.play();
+
     }
 
-    // Reset de la boucle
     setState(() {
       _a = null;
       _b = null;
       _loopEnabled = false;
     });
+    _scheduleAutosave(); // << on sauvegarde l’état initial du média ouvert
+  }
+
+  void _applySpeedToPlayers() {
+    if (_isVideo) {
+      _video?.setPlaybackSpeed(_speed);
+    } else {
+      _audio.setSpeed(_speed);
+    }
   }
 
   Future<void> _seek(Duration d) async {
@@ -177,6 +287,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (v == null) return;
       if (v.value.isPlaying) {
         await v.pause();
+        _scheduleAutosave(); // << sauve la position quand on met pause (vidéo)
       } else {
         await v.play();
       }
@@ -184,6 +295,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } else {
       if (_audio.playing) {
         await _audio.pause();
+        _scheduleAutosave(); // << sauve la position quand on met pause (audio)
       } else {
         await _audio.play();
       }
@@ -202,10 +314,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } else {
       await _audio.stop();
     }
+    _scheduleAutosave(); // << enregistre l’état et la position
   }
 
   // --------- Marqueurs A / B ----------
-  // A posé d'abord -> A prend la position courante. Si B existe déjà, on s’assure B > A (≥ A+4s)
   void _markA() {
     final now = _position;
     setState(() {
@@ -217,9 +329,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _loopEnabled = true;
       }
     });
+    _scheduleAutosave();
   }
 
-  // B posé : si A inexistant, A = B - 4s (borné) ; sinon B = now (au moins A+4s), active la boucle
   void _markBAndAutoLoop() {
     final now = _position;
 
@@ -241,6 +353,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _loopEnabled = true;
       });
     }
+    _scheduleAutosave();
   }
 
   void _clearLoop() {
@@ -249,9 +362,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _b = null;
       _loopEnabled = false;
     });
+    _scheduleAutosave();
   }
 
-  // Toggle rapide ON/OFF sans perdre A/B (si A/B manquent, on crée une petite fenêtre autour du curseur)
   void _toggleLoop() {
     if (_a == null || _b == null || !(_b! > _a!)) {
       final half = const Duration(milliseconds: 2000);
@@ -266,26 +379,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } else {
       setState(() => _loopEnabled = !_loopEnabled);
     }
+    _scheduleAutosave();
   }
 
-  // Vitesse
   Future<void> _setSpeed(double v) async {
     setState(() => _speed = v);
-    if (_isVideo) {
-      await _video?.setPlaybackSpeed(v);
-    } else {
-      await _audio.setSpeed(v);
-    }
+    _applySpeedToPlayers();
+    _scheduleAutosave();
   }
 
   // --------- UI ----------
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final isPlaying = _isVideo ? (_video?.value.isPlaying ?? false) : _audio.playing;
+    final isPlaying =
+    _isVideo ? (_video?.value.isPlaying ?? false) : _audio.playing;
 
     final aVal = _a ?? Duration.zero;
-    final bVal = _b ?? (_duration == Duration.zero ? const Duration(seconds: 1) : _duration);
+    final bVal =
+        _b ?? (_duration == Duration.zero ? const Duration(seconds: 1) : _duration);
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -304,7 +416,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       ),
       body: Column(
         children: [
-          // Zone vidéo (ou placeholder audio)
           Expanded(
             child: Center(
               child: _isVideo && _video != null && _video!.value.isInitialized
@@ -313,60 +424,62 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 child: VideoPlayer(_video!),
               )
                   : _mediaPath == null
-                  ? Text('Aucun média', style: theme.textTheme.titleMedium?.copyWith(color: Colors.white70))
-                  : const Icon(Icons.audiotrack, size: 96, color: Colors.white54),
+                  ? Text('Aucun média',
+                  style: theme.textTheme.titleMedium
+                      ?.copyWith(color: Colors.white70))
+                  : const Icon(Icons.audiotrack,
+                  size: 96, color: Colors.white54),
             ),
           ),
-
-          // Barre de progression
           if (_duration > Duration.zero)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
               child: Row(
                 children: [
-                  Text(_fmt(_position), style: const TextStyle(color: Colors.white70)),
+                  Text(_fmt(_position),
+                      style: const TextStyle(color: Colors.white70)),
                   Expanded(
                     child: Slider(
-                      value: _position.inMilliseconds.toDouble().clamp(0.0, _duration.inMilliseconds.toDouble()),
+                      value: _position.inMilliseconds
+                          .toDouble()
+                          .clamp(0.0, _duration.inMilliseconds.toDouble()),
                       min: 0,
                       max: _duration.inMilliseconds.toDouble(),
-                      onChanged: (v) => _seek(Duration(milliseconds: v.round())),
+                      onChanged: (v) =>
+                          _seek(Duration(milliseconds: v.round())),
                     ),
                   ),
-                  Text(_fmt(_duration), style: const TextStyle(color: Colors.white70)),
+                  Text(_fmt(_duration),
+                      style: const TextStyle(color: Colors.white70)),
                 ],
               ),
             ),
-
-          // Poignées de boucle (RangeSlider) + boutons A/B/Clear + ON/OFF
           if (_duration > Duration.zero)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
               child: Column(
                 children: [
-                  // A/B buttons + toggle + clear
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      // A
                       FilledButton.tonal(
                         style: FilledButton.styleFrom(
-                          backgroundColor: _a == null ? Colors.grey.shade800 : null,
+                          backgroundColor:
+                          _a == null ? Colors.grey.shade800 : null,
                         ),
                         onPressed: _markA,
                         child: const Text('A'),
                       ),
                       const SizedBox(width: 12),
-                      // B
                       FilledButton.tonal(
                         style: FilledButton.styleFrom(
-                          backgroundColor: _b == null ? Colors.grey.shade800 : null,
+                          backgroundColor:
+                          _b == null ? Colors.grey.shade800 : null,
                         ),
                         onPressed: _markBAndAutoLoop,
                         child: const Text('B'),
                       ),
                       const SizedBox(width: 12),
-                      // ON/OFF
                       IconButton.filled(
                         isSelected: _loopEnabled,
                         selectedIcon: const Icon(Icons.repeat_on),
@@ -374,7 +487,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         onPressed: _toggleLoop,
                       ),
                       const SizedBox(width: 8),
-                      // clear
                       IconButton(
                         tooltip: 'Supprimer la boucle',
                         onPressed: _clearLoop,
@@ -383,16 +495,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ],
                   ),
                   const SizedBox(height: 8),
-                  // Range slider pour A/B
                   RangeSlider(
                     values: RangeValues(
                       aVal.inMilliseconds.toDouble(),
                       bVal.inMilliseconds.toDouble(),
                     ),
                     min: 0,
-                    max: _duration.inMilliseconds.toDouble().clamp(1, double.infinity),
+                    max: _duration.inMilliseconds
+                        .toDouble()
+                        .clamp(1, double.infinity),
                     onChanged: (rv) {
-                      // On garde l’ordre A <= B
                       var aMs = rv.start.round();
                       var bMs = rv.end.round();
                       if (bMs <= aMs) bMs = aMs + 1;
@@ -400,26 +512,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         _a = Duration(milliseconds: aMs);
                         _b = Duration(milliseconds: bMs);
                       });
+                      _scheduleAutosave();
                     },
                     onChangeEnd: (_) {
                       if (_a != null && _b != null && _b! > _a!) {
                         setState(() => _loopEnabled = true);
                       }
+                      _scheduleAutosave();
                     },
                   ),
-                  // Légende A/B
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text('A ${_fmt(aVal)}', style: const TextStyle(color: Colors.white70)),
-                      Text('B ${_fmt(bVal)}', style: const TextStyle(color: Colors.white70)),
+                      Text('A ${_fmt(aVal)}',
+                          style: const TextStyle(color: Colors.white70)),
+                      Text('B ${_fmt(bVal)}',
+                          style: const TextStyle(color: Colors.white70)),
                     ],
                   ),
                 ],
               ),
             ),
-
-          // Vitesse
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 14),
             child: Column(
@@ -436,13 +549,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   value: _speed,
                   min: 0.5,
                   max: 1.5,
-                  onChanged: (v) => _setSpeed(double.parse(v.toStringAsFixed(2))),
+                  onChanged: (v) =>
+                      _setSpeed(double.parse(v.toStringAsFixed(2))),
                 ),
               ],
             ),
           ),
-
-          // Contrôles lecture minimalistes
           Padding(
             padding: const EdgeInsets.only(bottom: 10),
             child: Row(
