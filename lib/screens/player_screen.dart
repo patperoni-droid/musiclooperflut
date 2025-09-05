@@ -102,42 +102,45 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
       final path = sp.getString('$_kSessionKey.path');
       final isVideo = sp.getBool('$_kSessionKey.isVideo') ?? false;
-      final posMs = sp.getInt(_kPosMsKey);
-      final wantResume = sp.getBool(_kResumeFlagKey) ?? true;
-
-      if (wantResume) {
-        final savedPos = _msToDur(posMs) ?? Duration.zero;
-        // borne la position : 0 <= pos <= (duration - 300ms) pour éviter un seek tout en fin de piste
-        final safeMax = (_duration > const Duration(milliseconds: 300))
-            ? _duration - const Duration(milliseconds: 300)
-            : Duration.zero;
-        final target = _clampDur(savedPos, Duration.zero, safeMax);
-
-        if (target > Duration.zero) {
-          await _seek(target);
-        }
-      }
       final speed = sp.getDouble('$_kSessionKey.speed') ?? 1.0;
       final aMs = sp.getInt('$_kSessionKey.aMs');
       final bMs = sp.getInt('$_kSessionKey.bMs');
       final loop = sp.getBool('$_kSessionKey.loop') ?? false;
 
+      final posMs = sp.getInt(_kPosMsKey);
+      final wantResume = sp.getBool(_kResumeFlagKey) ?? true;
+
       if (path == null || path.isEmpty) return;
       if (!File(path).existsSync()) return;
 
+      // ouvre le média (initialise les players)
       await _openMediaFromPath(path, isVideo: isVideo);
 
+      // applique vitesse + A/B + loop
       setState(() {
         _speed = speed.clamp(0.5, 1.5);
         _a = _msToDur(aMs);
         _b = _msToDur(bMs);
         _loopEnabled = loop && (_a != null && _b != null && _b! > _a!);
       });
-
       _applySpeedToPlayers();
-    } catch (_) {}
-  }
 
+      // 🔑 attends que la durée réelle soit connue avant de seek
+      final realDur = await _waitForNonZeroDuration();
+      if (wantResume) {
+        final savedPos = _msToDur(posMs) ?? Duration.zero;
+        final safeMax = (realDur > const Duration(milliseconds: 300))
+            ? realDur - const Duration(milliseconds: 300)
+            : Duration.zero;
+        final target = _clampDur(savedPos, Duration.zero, safeMax);
+        if (target > Duration.zero) {
+          await _seek(target);
+        }
+      }
+    } catch (_) {
+      // on ignore silencieusement
+    }
+  }
   // --------- Cycle de vie ----------
   @override
   void initState() {
@@ -148,8 +151,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
-    _ticker?.cancel();
     _autosaveTimer?.cancel();
+    // on essaie de sauvegarder une dernière fois (sans bloquer)
+    unawaited(_saveSession());
+    _ticker?.cancel();
     _video?.dispose();
     _audio.dispose();
     super.dispose();
