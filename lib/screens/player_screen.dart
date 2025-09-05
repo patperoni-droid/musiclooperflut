@@ -1,25 +1,226 @@
 import 'dart:async';
 import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 import 'package:path/path.dart' as p;
-import 'package:shared_preferences/shared_preferences.dart';
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key});
-
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends State<PlayerScreen> {
-  // --------- Constantes / helpers ----------
-  static const Duration _kQuickGap = Duration(seconds: 4);
-  static const _kPosMsKey = 'looptrainer_session_v1.positionMs';
-  static const _kResumeFlagKey = 'looptrainer_session_v1.resumeWanted';
+class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver {
+  // ---------- état média ----------
+  String? _mediaPath;
+  bool get _isVideo => _mediaPath != null && _video != null;
+
+  VideoPlayerController? _video;
+  final AudioPlayer _audio = AudioPlayer();
+  StreamSubscription<Duration>? _posSub;
+
+  Duration _duration = Duration.zero;
+  Duration _position = Duration.zero;
+
+  // ---------- A/B & boucle ----------
+  Duration? _a;
+  Duration? _b;
+  bool _loopEnabled = false;
+  static const int _quickGapMs = 4000; // A = B-4s quand B d’abord
+
+  // ---------- vitesse ----------
+  double _speed = 1.0;
+
+  // ---------- prefs ----------
+  SharedPreferences? _prefs;
+  static const _kPrefPath = 'last.media';
+  static const _kPrefSpeed = 'last.speed';
+  static const _kPrefA = 'last.a';
+  static const _kPrefB = 'last.b';
+  static const _kPrefLoop = 'last.loop';
+
+  // ---------- lifecycle ----------
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _restore();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _posSub?.cancel();
+    _audio.dispose();
+    _video?.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) _save();
+  }
+
+  // =========================================================
+  //                     UI HELPERS
+  // =========================================================
+
+  // Couleurs sobres
+  Color get _accent => const Color(0xFFFF9500); // orange discret
+  Color get _muted => Colors.white.withOpacity(0.6);
+
+  // =========================================================
+  //                  CHARGEMENT / SAUVEGARDE
+  // =========================================================
+
+  Future<void> _restore() async {
+    _prefs ??= await SharedPreferences.getInstance();
+    final path = _prefs!.getString(_kPrefPath);
+    _speed = _prefs!.getDouble(_kPrefSpeed) ?? 1.0;
+    _loopEnabled = _prefs!.getBool(_kPrefLoop) ?? false;
+
+    final aMs = _prefs!.getInt(_kPrefA);
+    final bMs = _prefs!.getInt(_kPrefB);
+    _a = aMs != null ? Duration(milliseconds: aMs) : null;
+    _b = bMs != null ? Duration(milliseconds: bMs) : null;
+
+    if (path != null && File(path).existsSync()) {
+      await _openPath(path, autostart: false);
+    } else {
+      setState(() {}); // juste pour peindre l’écran vide
+    }
+  }
+
+  Future<void> _save() async {
+    _prefs ??= await SharedPreferences.getInstance();
+    if (_mediaPath != null) _prefs!.setString(_kPrefPath, _mediaPath!);
+    _prefs!.setDouble(_kPrefSpeed, _speed);
+    _prefs!.setBool(_kPrefLoop, _loopEnabled);
+    _prefs!.setInt(_kPrefA, _a?.inMilliseconds ?? -1);
+    _prefs!.setInt(_kPrefB, _b?.inMilliseconds ?? -1);
+  }
+
+  // =========================================================
+  //                         MEDIA
+  // =========================================================
+
+  Future<void> _pickFile() async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const [
+        'mp4','mov','m4v','mp3','wav','aac','m4a'
+      ],
+    );
+    final path = res?.files.single.path;
+    if (path == null) return;
+    await _openPath(path);
+  }
+
+  Future<void> _openPath(String path, {bool autostart = true}) async {
+    // stop & clean
+    _posSub?.cancel();
+    await _audio.stop();
+    await _video?.pause();
+    await _video?.dispose();
+
+    _mediaPath = path;
+    final ext = p.extension(path).toLowerCase();
+
+    if (<String>{'.mp4','.mov','.m4v'}.contains(ext)) {
+      final c = VideoPlayerController.file(File(path));
+      await c.initialize();
+      _video = c;
+      _duration = c.value.duration;
+      _position = Duration.zero;
+
+      // position stream (via timer “simulateur”)
+      // Abonnement "ticker" vidéo : émet bien des Duration
+      _posSub = Stream<Duration>
+          .periodic(const Duration(milliseconds: 200), (_) {
+        // On renvoie une Duration pour typage strict
+        return _video?.value.position ?? Duration.zero;
+      })
+          .listen((pos) {
+        _onTick(pos); // ta fonction qui réagit à la position
+      });
+      if (autostart) {
+        await c.play();
+        await c.setPlaybackSpeed(_speed);
+      }
+    } else {
+      // audio
+      await _audio.setFilePath(path);
+      await _audio.setSpeed(_speed);
+      _duration = _audio.duration ?? Duration.zero;
+      _position = Duration.zero;
+      _posSub = _audio.positionStream.listen(_onTick);
+      if (autostart) await _audio.play();
+    }
+
+    // clamp A/B dans la nouvelle durée
+    if (_duration == Duration.zero) {
+      _a = null; _b = null; _loopEnabled = false;
+    } else {
+      if (_a != null) _a = _clampDur(_a!, Duration.zero, _duration);
+      if (_b != null) _b = _clampDur(_b!, Duration.zero, _duration);
+      if (_a != null && _b != null && !(_a! < _b!)) _loopEnabled = false;
+    }
+
+    setState(() {});
+    _save();
+  }
+
+  // tick: applique la logique de boucle
+  void _onTick(Duration pos) {
+    if (!mounted) return;
+    if (_duration == Duration.zero) return;
+
+    // boucle A/B
+    if (_loopEnabled && _a != null && _b != null && _a! < _b!) {
+      if (pos >= _b!) {
+        _seek(_a!);
+        return;
+      }
+    }
+    setState(() => _position = pos);
+  }
+
+  Future<void> _playPause() async {
+    if (_mediaPath == null) {
+      await _pickFile();
+      return;
+    }
+    if (_video != null) {
+      if (_video!.value.isPlaying) {
+        await _video!.pause();
+      } else {
+        await _video!.play();
+      }
+      return;
+    }
+    if (_audio.playing) {
+      await _audio.pause();
+    } else {
+      await _audio.play();
+    }
+  }
+
+  Future<void> _seek(Duration d) async {
+    d = _clampDur(d, Duration.zero, _duration);
+    if (_video != null) {
+      await _video!.seekTo(d);
+    } else {
+      await _audio.seek(d);
+    }
+    setState(() => _position = d);
+  }
+
+  // =========================================================
+  //                        A / B  LOGIC
+  // =========================================================
 
   Duration _clampDur(Duration d, Duration min, Duration max) {
     if (d < min) return min;
@@ -27,338 +228,46 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return d;
   }
 
-  Future<Duration> _waitForNonZeroDuration({Duration timeout = const Duration(seconds: 2)}) async {
-    final start = DateTime.now();
-    while (true) {
-      final dur = await _currentDuration();
-      if (dur > Duration.zero) return dur;
-      if (DateTime.now().difference(start) > timeout) return dur; // on sort quand même
-      await Future.delayed(const Duration(milliseconds: 50));
-    }
-  }
-  String _fmt(Duration d) {
-    final s = d.inSeconds;
-    final mm = (s ~/ 60).toString().padLeft(2, '0');
-    final ss = (s % 60).toString().padLeft(2, '0');
-    return '$mm:$ss';
-  }
-
-  // --------- Etat média ----------
-  String? _mediaPath;
-  bool _isVideo = false;
-
-  VideoPlayerController? _video;
-  final _audio = AudioPlayer();
-
-  // Timeline
-  Duration _duration = Duration.zero;
-  Duration _position = Duration.zero;
-
-  // Boucle A/B
-  Duration? _a;
-  Duration? _b;
-  bool _loopEnabled = false;
-
-  // Vitesse
-  double _speed = 1.0;
-
-  // Ticker de position
-  Timer? _ticker;
-
-  // --------- Session / autosave ----------
-  SharedPreferences? _prefs;
-  Timer? _autosaveTimer;
-  static const _kSessionKey = 'looptrainer_session_v1';
-
-  int _durToMs(Duration? d) => d == null ? -1 : d.inMilliseconds;
-  Duration? _msToDur(int? ms) =>
-      (ms == null || ms < 0) ? null : Duration(milliseconds: ms);
-
-  void _scheduleAutosave() {
-    _autosaveTimer?.cancel();
-    _autosaveTimer = Timer(const Duration(milliseconds: 500), _saveSession);
-  }
-
-  Future<void> _saveSession() async {
-    try {
-      final sp = _prefs ??= await SharedPreferences.getInstance();
-
-      await sp.setString('$_kSessionKey.path', _mediaPath ?? '');
-      await sp.setBool('$_kSessionKey.isVideo', _isVideo);
-      await sp.setDouble('$_kSessionKey.speed', _speed);
-
-      await sp.setInt('$_kSessionKey.aMs', _durToMs(_a));
-      await sp.setInt('$_kSessionKey.bMs', _durToMs(_b));
-      await sp.setBool('$_kSessionKey.loop', _loopEnabled);
-      await sp.setInt(_kPosMsKey, _durToMs(_position));
-// Flag pour dire qu'on souhaite reprendre à la relance (pratique si on veut désactiver plus tard)
-      await sp.setBool(_kResumeFlagKey, true);
-    } catch (_) {}
-  }
-
-  Future<void> _restoreSession() async {
-    try {
-      final sp = _prefs ??= await SharedPreferences.getInstance();
-
-      final path = sp.getString('$_kSessionKey.path');
-      final isVideo = sp.getBool('$_kSessionKey.isVideo') ?? false;
-      final speed = sp.getDouble('$_kSessionKey.speed') ?? 1.0;
-      final aMs = sp.getInt('$_kSessionKey.aMs');
-      final bMs = sp.getInt('$_kSessionKey.bMs');
-      final loop = sp.getBool('$_kSessionKey.loop') ?? false;
-
-      final posMs = sp.getInt(_kPosMsKey);
-      final wantResume = sp.getBool(_kResumeFlagKey) ?? true;
-
-      if (path == null || path.isEmpty) return;
-      if (!File(path).existsSync()) return;
-
-      // ouvre le média (initialise les players)
-      await _openMediaFromPath(path, isVideo: isVideo);
-
-      // applique vitesse + A/B + loop
-      setState(() {
-        _speed = speed.clamp(0.5, 1.5);
-        _a = _msToDur(aMs);
-        _b = _msToDur(bMs);
-        _loopEnabled = loop && (_a != null && _b != null && _b! > _a!);
-      });
-      _applySpeedToPlayers();
-
-      // 🔑 attends que la durée réelle soit connue avant de seek
-      final realDur = await _waitForNonZeroDuration();
-      if (wantResume) {
-        final savedPos = _msToDur(posMs) ?? Duration.zero;
-        final safeMax = (realDur > const Duration(milliseconds: 300))
-            ? realDur - const Duration(milliseconds: 300)
-            : Duration.zero;
-        final target = _clampDur(savedPos, Duration.zero, safeMax);
-        if (target > Duration.zero) {
-          await _seek(target);
-        }
-      }
-    } catch (_) {
-      // on ignore silencieusement
-    }
-  }
-  // --------- Cycle de vie ----------
-  @override
-  void initState() {
-    super.initState();
-    _startTicker();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _restoreSession());
-  }
-
-  @override
-  void dispose() {
-    _autosaveTimer?.cancel();
-    // on essaie de sauvegarder une dernière fois (sans bloquer)
-    unawaited(_saveSession());
-    _ticker?.cancel();
-    _video?.dispose();
-    _audio.dispose();
-    super.dispose();
-  }
-
-  void _startTicker() {
-    _ticker?.cancel();
-    _ticker = Timer.periodic(const Duration(milliseconds: 120), (_) async {
-      if (!mounted) return;
-      final pos = await _currentPosition();
-      final dur = await _currentDuration();
-
-      if (pos != _position || dur != _duration) {
-        setState(() {
-          _position = pos;
-          _duration = dur;
-          if (pos != _position || dur != _duration) {
-            setState(() {
-              _position = pos;
-              _duration = dur;
-            });
-            // Sauvegarde légère de la position (toutes les ~500 ms grâce à _scheduleAutosave)
-            _scheduleAutosave();
-          }
-        });
-      }
-
-      if (_loopEnabled && _a != null && _b != null && _b! > _a!) {
-        if (pos >= _b!) {
-          unawaited(_seek(_a!));
-        }
-      }
-    });
-  }
-
-  Future<Duration> _currentPosition() async {
-    if (_isVideo) {
-      final v = _video;
-      if (v == null) return Duration.zero;
-      return v.value.position;
-    } else {
-      return _audio.position;
-    }
-  }
-
-  Future<Duration> _currentDuration() async {
-    if (_isVideo) {
-      final v = _video;
-      if (v == null) return Duration.zero;
-      return v.value.duration ?? Duration.zero;
-    } else {
-      return _audio.duration ?? Duration.zero;
-    }
-  }
-
-  // --------- Ouverture média ----------
-  Future<void> _pickFile() async {
-    final res = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: [
-        'mp3', 'm4a', 'aac', 'wav', 'ogg', 'flac',
-        'mp4', 'mov', 'mkv', 'webm'
-      ],
-    );
-    if (res == null || res.files.single.path == null) return;
-    await _openMediaFromPath(res.files.single.path!);
-    _scheduleAutosave();
-  }
-
-  Future<void> _openMediaFromPath(String path, {bool? isVideo}) async {
-    final ext = p.extension(path).toLowerCase();
-    _stop();
-
-    final isVid = isVideo ??
-        ['.mp4', '.mov', '.mkv', '.webm'].contains(ext);
-
-    if (isVid) {
-      final controller = VideoPlayerController.file(File(path));
-      await controller.initialize();
-      await controller.setLooping(false);
-      await controller.setPlaybackSpeed(_speed);
-      setState(() {
-        _isVideo = true;
-        _mediaPath = path;
-        _video = controller;
-      });
-      _scheduleAutosave(); // << ajoute ici pour vidéo
-      await controller.play();
-      await controller.play();
-    } else {
-      await _audio.setFilePath(path);
-      await _audio.setLoopMode(LoopMode.off);
-      await _audio.setSpeed(_speed);
-      setState(() {
-        _isVideo = false;
-        _mediaPath = path;
-      });
-      setState(() {
-        _isVideo = false;
-        _mediaPath = path;
-      });
-      _scheduleAutosave(); // << ajoute ici pour audio
-      await _audio.play();
-
-    }
-
-    setState(() {
-      _a = null;
-      _b = null;
-      _loopEnabled = false;
-    });
-    _scheduleAutosave(); // << on sauvegarde l’état initial du média ouvert
-  }
-
-  void _applySpeedToPlayers() {
-    if (_isVideo) {
-      _video?.setPlaybackSpeed(_speed);
-    } else {
-      _audio.setSpeed(_speed);
-    }
-  }
-
-  Future<void> _seek(Duration d) async {
-    d = _clampDur(d, Duration.zero, _duration);
-    if (_isVideo) {
-      await _video?.seekTo(d);
-    } else {
-      await _audio.seek(d);
-    }
-  }
-
-  Future<void> _playPause() async {
-    if (_isVideo) {
-      final v = _video;
-      if (v == null) return;
-      if (v.value.isPlaying) {
-        await v.pause();
-        _scheduleAutosave(); // << sauve la position quand on met pause (vidéo)
-      } else {
-        await v.play();
-      }
-      setState(() {});
-    } else {
-      if (_audio.playing) {
-        await _audio.pause();
-        _scheduleAutosave(); // << sauve la position quand on met pause (audio)
-      } else {
-        await _audio.play();
-      }
-      setState(() {});
-    }
-  }
-
-  Future<void> _stop() async {
-    _loopEnabled = false;
-    _a = null;
-    _b = null;
-    if (_isVideo) {
-      await _video?.pause();
-      await _video?.dispose();
-      _video = null;
-    } else {
-      await _audio.stop();
-    }
-    _scheduleAutosave(); // << enregistre l’état et la position
-  }
-
-  // --------- Marqueurs A / B ----------
+  // Bouton A : peut être posé en premier
   void _markA() {
+    if (_duration == Duration.zero) return;
     final now = _position;
-    setState(() {
-      _a = now;
-      if (_b != null) {
-        if (_b! <= _a!) {
-          _b = _clampDur(_a! + _kQuickGap, Duration.zero, _duration);
-        }
-        _loopEnabled = true;
-      }
-    });
-    _scheduleAutosave();
+    if (_b == null) {
+      // A en premier -> juste positionner A pour l’instant
+      setState(() {
+        _a = now;
+        _loopEnabled = false; // pas de boucle tant que B absent
+      });
+    } else {
+      // B existe déjà -> activer si A < B
+      setState(() {
+        _a = now;
+        _loopEnabled = (_a! < _b!);
+      });
+    }
+    _save();
   }
 
-  void _markBAndAutoLoop() {
+  // Bouton B : si A absent -> A = B - 4s borné à 0
+  void _markB() {
+    if (_duration == Duration.zero) return;
     final now = _position;
 
     if (_a == null) {
-      final aCand = now - _kQuickGap;
-      final a = _clampDur(aCand, Duration.zero, _duration);
+      final candA = now - Duration(milliseconds: _quickGapMs);
+      final a = _clampDur(candA, Duration.zero, _duration);
       setState(() {
         _a = a;
         _b = now;
-        _loopEnabled = true;
+        _loopEnabled = (_a! < _b!);
       });
     } else {
-      var bFixed = now;
-      if (bFixed <= _a!) {
-        bFixed = _clampDur(_a! + _kQuickGap, Duration.zero, _duration);
-      }
       setState(() {
-        _b = bFixed;
-        _loopEnabled = true;
+        _b = now;
+        _loopEnabled = (_a! < _b!);
       });
     }
-    _scheduleAutosave();
+    _save();
   }
 
   void _clearLoop() {
@@ -367,15 +276,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _b = null;
       _loopEnabled = false;
     });
-    _scheduleAutosave();
+    _save();
   }
 
-  void _toggleLoop() {
-    if (_a == null || _b == null || !(_b! > _a!)) {
-      final half = const Duration(milliseconds: 2000);
-      final a = _clampDur(_position - half, Duration.zero, _duration);
+  void _toggleLoopEnabled() {
+    // Si A/B invalides, on fabrique une petite fenêtre autour du curseur
+    if (_a == null || _b == null || !(_a! < _b!)) {
+      final half = Duration(milliseconds: (_quickGapMs / 2).round());
+      var a = _clampDur(_position - half, Duration.zero, _duration);
       var b = _clampDur(_position + half, Duration.zero, _duration);
-      if (b <= a) b = _clampDur(a + _kQuickGap, Duration.zero, _duration);
+      if (b <= a) b = _clampDur(a + const Duration(milliseconds: 200), Duration.zero, _duration);
       setState(() {
         _a = a;
         _b = b;
@@ -384,208 +294,386 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } else {
       setState(() => _loopEnabled = !_loopEnabled);
     }
-    _scheduleAutosave();
+    _save();
   }
 
-  Future<void> _setSpeed(double v) async {
-    setState(() => _speed = v);
-    _applySpeedToPlayers();
-    _scheduleAutosave();
+  // =========================================================
+  //                         VITESSE
+  // =========================================================
+
+  Future<void> _applySpeed(double v) async {
+    v = v.clamp(0.25, 2.0);
+    setState(() => _speed = double.parse(v.toStringAsFixed(2)));
+    if (_video != null) {
+      await _video!.setPlaybackSpeed(_speed);
+    } else {
+      await _audio.setSpeed(_speed);
+    }
+    _save();
   }
 
-  // --------- UI ----------
+  // =========================================================
+  //                            UI
+  // =========================================================
+
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final isPlaying =
-    _isVideo ? (_video?.value.isPlaying ?? false) : _audio.playing;
-
-    final aVal = _a ?? Duration.zero;
-    final bVal =
-        _b ?? (_duration == Duration.zero ? const Duration(seconds: 1) : _duration);
+    final title = _mediaPath == null ? 'Aucun fichier' : p.basename(_mediaPath!);
 
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(
-        title: Text(
-          _mediaPath == null ? 'Lecteur' : p.basename(_mediaPath!),
-          overflow: TextOverflow.ellipsis,
-        ),
-        actions: [
-          IconButton(
-            tooltip: 'Ouvrir un fichier',
-            onPressed: _pickFile,
-            icon: const Icon(Icons.folder_open),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: Center(
-              child: _isVideo && _video != null && _video!.value.isInitialized
-                  ? AspectRatio(
-                aspectRatio: _video!.value.aspectRatio,
-                child: VideoPlayer(_video!),
-              )
-                  : _mediaPath == null
-                  ? Text('Aucun média',
-                  style: theme.textTheme.titleMedium
-                      ?.copyWith(color: Colors.white70))
-                  : const Icon(Icons.audiotrack,
-                  size: 96, color: Colors.white54),
-            ),
-          ),
-          if (_duration > Duration.zero)
+      body: SafeArea(
+        child: Column(
+          children: [
+            // ---------- top bar ----------
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               child: Row(
                 children: [
-                  Text(_fmt(_position),
-                      style: const TextStyle(color: Colors.white70)),
                   Expanded(
-                    child: Slider(
-                      value: _position.inMilliseconds
-                          .toDouble()
-                          .clamp(0.0, _duration.inMilliseconds.toDouble()),
-                      min: 0,
-                      max: _duration.inMilliseconds.toDouble(),
-                      onChanged: (v) =>
-                          _seek(Duration(milliseconds: v.round())),
+                    child: Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600),
                     ),
                   ),
-                  Text(_fmt(_duration),
-                      style: const TextStyle(color: Colors.white70)),
+                  IconButton(
+                    tooltip: 'Ouvrir…',
+                    onPressed: _pickFile,
+                    icon: const Icon(Icons.folder_open, color: Colors.white),
+                  ),
                 ],
               ),
             ),
-          if (_duration > Duration.zero)
+
+            // ---------- media area ----------
+            Expanded(
+              child: GestureDetector(
+                onTap: _playPause,
+                child: Center(
+                  child: AspectRatio(
+                    aspectRatio: _video?.value.aspectRatio ?? (9 / 16),
+                    child: _video != null
+                        ? Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        VideoPlayer(_video!),
+                        _PlayOverlay(isPlaying: _video!.value.isPlaying),
+                      ],
+                    )
+                        : _audioArea(),
+                  ),
+                ),
+              ),
+            ),
+
+            // ---------- controls minimal ----------
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              child: Column(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 2),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      FilledButton.tonal(
-                        style: FilledButton.styleFrom(
-                          backgroundColor:
-                          _a == null ? Colors.grey.shade800 : null,
-                        ),
-                        onPressed: _markA,
-                        child: const Text('A'),
-                      ),
-                      const SizedBox(width: 12),
-                      FilledButton.tonal(
-                        style: FilledButton.styleFrom(
-                          backgroundColor:
-                          _b == null ? Colors.grey.shade800 : null,
-                        ),
-                        onPressed: _markBAndAutoLoop,
-                        child: const Text('B'),
-                      ),
-                      const SizedBox(width: 12),
-                      IconButton.filled(
-                        isSelected: _loopEnabled,
-                        selectedIcon: const Icon(Icons.repeat_on),
-                        icon: const Icon(Icons.repeat),
-                        onPressed: _toggleLoop,
-                      ),
-                      const SizedBox(width: 8),
-                      IconButton(
-                        tooltip: 'Supprimer la boucle',
-                        onPressed: _clearLoop,
-                        icon: const Icon(Icons.close),
-                      ),
-                    ],
+                  // A
+                  _LoopBtn(
+                    label: 'A',
+                    onTap: _markA,
+                    active: _a != null,
+                    accent: _accent,
                   ),
-                  const SizedBox(height: 8),
-                  RangeSlider(
-                    values: RangeValues(
-                      aVal.inMilliseconds.toDouble(),
-                      bVal.inMilliseconds.toDouble(),
+                  // B
+                  _LoopBtn(
+                    label: 'B',
+                    onTap: _markB,
+                    active: _b != null,
+                    accent: _accent,
+                  ),
+                  // loop toggle
+                  IconButton(
+                    tooltip: _loopEnabled ? 'Boucle activée' : 'Boucle désactivée',
+                    onPressed: _toggleLoopEnabled,
+                    icon: Icon(
+                      Icons.loop,
+                      color: _loopEnabled ? _accent : _muted,
                     ),
-                    min: 0,
-                    max: _duration.inMilliseconds
-                        .toDouble()
-                        .clamp(1, double.infinity),
-                    onChanged: (rv) {
-                      var aMs = rv.start.round();
-                      var bMs = rv.end.round();
-                      if (bMs <= aMs) bMs = aMs + 1;
-                      setState(() {
-                        _a = Duration(milliseconds: aMs);
-                        _b = Duration(milliseconds: bMs);
-                      });
-                      _scheduleAutosave();
-                    },
-                    onChangeEnd: (_) {
-                      if (_a != null && _b != null && _b! > _a!) {
-                        setState(() => _loopEnabled = true);
-                      }
-                      _scheduleAutosave();
-                    },
                   ),
+                  // effacer
+                  IconButton(
+                    tooltip: 'Effacer A/B',
+                    onPressed: _clearLoop,
+                    icon: Icon(Icons.close, color: _muted),
+                  ),
+                  // vitesse stepper simple
                   Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text('A ${_fmt(aVal)}',
-                          style: const TextStyle(color: Colors.white70)),
-                      Text('B ${_fmt(bVal)}',
-                          style: const TextStyle(color: Colors.white70)),
+                      _MiniIcon(onTap: () => _applySpeed(_speed - 0.1), icon: Icons.remove),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        child: Text('${_speed.toStringAsFixed(2)}x', style: TextStyle(color: _muted, fontSize: 16)),
+                      ),
+                      _MiniIcon(onTap: () => _applySpeed(_speed + 0.1), icon: Icons.add),
                     ],
+                  ),
+                  // play/pause
+                  IconButton(
+                    onPressed: _playPause,
+                    icon: Icon(
+                      (_video?.value.isPlaying ?? _audio.playing) ? Icons.pause_circle_filled : Icons.play_circle_fill,
+                      color: Colors.white,
+                      size: 30,
+                    ),
                   ),
                 ],
               ),
             ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 6, 16, 14),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    const Icon(Icons.speed, color: Colors.white70),
-                    const SizedBox(width: 8),
-                    Text('Vitesse ${_speed.toStringAsFixed(2)}x',
-                        style: const TextStyle(color: Colors.white70)),
-                  ],
-                ),
-                Slider(
-                  value: _speed,
-                  min: 0.5,
-                  max: 1.5,
-                  onChanged: (v) =>
-                      _setSpeed(double.parse(v.toStringAsFixed(2))),
-                ),
-              ],
+
+            // ---------- single progress bar (position) + A/B thumbs superposées ----------
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 2, 8, 10),
+              child: _timeline(),
             ),
-          ),
-          Padding(
-            padding: const EdgeInsets.only(bottom: 10),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                IconButton(
-                  tooltip: 'Reculer 5s',
-                  onPressed: () => _seek(_position - const Duration(seconds: 5)),
-                  icon: const Icon(Icons.replay_5, color: Colors.white),
-                ),
-                const SizedBox(width: 8),
-                FilledButton(
-                  onPressed: _playPause,
-                  child: Icon(isPlaying ? Icons.pause : Icons.play_arrow),
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  tooltip: 'Avancer 5s',
-                  onPressed: () => _seek(_position + const Duration(seconds: 5)),
-                  icon: const Icon(Icons.forward_5, color: Colors.white),
-                ),
-              ],
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
+  }
+
+  Widget _audioArea() {
+    return Container(
+      color: Colors.black,
+      child: Center(
+        child: Icon(
+          (_audio.playing) ? Icons.graphic_eq : Icons.audiotrack,
+          size: 72,
+          color: _muted,
+        ),
+      ),
+    );
+  }
+
+  Widget _timeline() {
+    final dur = _duration.inMilliseconds.toDouble();
+    final pos = _position.inMilliseconds.toDouble().clamp(0.0, dur.isFinite && dur > 0 ? dur : 0.0);
+
+    // valeurs A/B normalisées 0..1
+    double aNorm = (_a?.inMilliseconds ?? 0).toDouble();
+    double bNorm = (_b?.inMilliseconds ?? (_a != null ? (_a!.inMilliseconds + 1000) : 1000)).toDouble();
+    if (dur <= 0) {
+      aNorm = 0;
+      bNorm = 1000;
+    }
+    aNorm = (dur <= 0) ? 0 : (aNorm / dur).clamp(0.0, 1.0);
+    bNorm = (dur <= 0) ? 0 : (bNorm / dur).clamp(0.0, 1.0);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // time labels
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(_fmt(_position), style: TextStyle(color: _muted, fontSize: 12)),
+            Text(_fmt(_duration), style: TextStyle(color: _muted, fontSize: 12)),
+          ],
+        ),
+        const SizedBox(height: 6),
+
+        // stack = slider position + “poignées” A/B
+        SizedBox(
+          height: 42,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              // progress (scrubbable)
+              SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 4,
+                  activeTrackColor: _accent,
+                  inactiveTrackColor: Colors.white24,
+                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+                  overlayShape: SliderComponentShape.noOverlay,
+                ),
+                child: Slider(
+                  value: dur > 0 ? pos : 0,
+                  min: 0,
+                  max: dur > 0 ? dur : 1,
+                  onChanged: dur > 0 ? (v) => setState(() => _position = Duration(milliseconds: v.round())) : null,
+                  onChangeEnd: dur > 0 ? (v) => _seek(Duration(milliseconds: v.round())) : null,
+                ),
+              ),
+
+              // A/B handles (RangeSlider “translucide”)
+// A/B handles (RangeSlider translucide, mais clics passés au Slider dessous)
+              IgnorePointer(
+                ignoring: false, // 👈 permet toujours au Slider de recevoir les gestes
+                child: SizedBox(
+                  height: 42,
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      trackHeight: 0, // pas de piste visible
+                      activeTrackColor: Colors.transparent,
+                      inactiveTrackColor: Colors.transparent,
+                      thumbShape: _DiamondThumb(color: _accent),
+                      overlayShape: SliderComponentShape.noOverlay,
+                    ),
+                    child: RangeSlider(
+                      values: RangeValues(aNorm, bNorm),
+                      min: 0,
+                      max: 1,
+                      onChanged: (rng) {
+                        final newA = Duration(milliseconds: (rng.start * dur).round());
+                        final newB = Duration(milliseconds: (rng.end * dur).round());
+                        setState(() {
+                          _a = newA;
+                          _b = newB;
+                        });
+                      },
+                      onChangeEnd: (_) => _save(),
+                    ),
+                  ),
+                ),
+              ),
+
+              // petites marques A / B au-dessus
+              if (_a != null && dur > 0)
+                Positioned(
+                  left: (aNorm * MediaQuery.of(context).size.width).clamp(0, MediaQuery.of(context).size.width - 20),
+                  top: 0,
+                  child: _markerLabel('A'),
+                ),
+              if (_b != null && dur > 0)
+                Positioned(
+                  left: (bNorm * MediaQuery.of(context).size.width).clamp(0, MediaQuery.of(context).size.width - 20),
+                  top: 0,
+                  child: _markerLabel('B'),
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _markerLabel(String s) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+    decoration: BoxDecoration(
+      color: Colors.black.withOpacity(0.6),
+      borderRadius: BorderRadius.circular(6),
+      border: Border.all(color: _accent, width: 1),
+    ),
+    child: Text(s, style: TextStyle(color: _accent, fontWeight: FontWeight.w700, fontSize: 11)),
+  );
+
+  String _fmt(Duration d) {
+    final t = d.inMilliseconds < 0 ? Duration.zero : d;
+    final h = t.inHours;
+    final m = t.inMinutes.remainder(60);
+    final s = t.inSeconds.remainder(60);
+    final ms = (t.inMilliseconds.remainder(1000) / 10).round();
+    if (h > 0) {
+      return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+    }
+    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+  }
+}
+
+// ===================== widgets discrets =====================
+
+class _PlayOverlay extends StatelessWidget {
+  final bool isPlaying;
+  const _PlayOverlay({required this.isPlaying});
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Center(
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 150),
+          opacity: isPlaying ? 0.0 : 0.9,
+          child: Icon(Icons.play_circle_fill, size: 84, color: Colors.white70),
+        ),
+      ),
+    );
+  }
+}
+
+class _LoopBtn extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+  final bool active;
+  final Color accent;
+  const _LoopBtn({required this.label, required this.onTap, required this.active, required this.accent});
+
+  @override
+  Widget build(BuildContext context) {
+    final off = Colors.white.withOpacity(0.35);
+    return OutlinedButton(
+      style: OutlinedButton.styleFrom(
+        foregroundColor: active ? accent : off,
+        side: BorderSide(color: active ? accent : off, width: 1.4),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        minimumSize: const Size(40, 36),
+      ),
+      onPressed: onTap,
+      child: Text(label, style: TextStyle(fontWeight: FontWeight.w700, color: active ? accent : off)),
+    );
+  }
+}
+
+class _MiniIcon extends StatelessWidget {
+  final VoidCallback onTap;
+  final IconData icon;
+  const _MiniIcon({required this.onTap, required this.icon});
+  @override
+  Widget build(BuildContext context) {
+    return InkResponse(
+      radius: 18,
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.all(6.0),
+        child: Icon(icon, size: 18, color: Colors.white70),
+      ),
+    );
+  }
+}
+
+// Petit losange pour les “poignées” A/B
+class _DiamondThumb extends SliderComponentShape {
+  final double size;
+  final Color color;
+  const _DiamondThumb({this.size = 12, required this.color});
+
+  @override
+  Size getPreferredSize(bool isEnabled, bool isDiscrete) => Size.square(size);
+
+  @override
+  void paint(
+      PaintingContext context,
+      Offset center, {
+        required Animation<double> activationAnimation,
+        required Animation<double> enableAnimation,
+        required bool isDiscrete,
+        required TextPainter labelPainter,
+        required RenderBox parentBox,
+        required SliderThemeData sliderTheme,
+        required TextDirection textDirection,
+        required double value,
+        required double textScaleFactor,
+        required Size sizeWithOverflow,
+      }) {
+    final canvas = context.canvas;
+    final paint = Paint()..color = color;
+    final path = Path()
+      ..moveTo(center.dx, center.dy - size / 2)
+      ..lineTo(center.dx + size / 2, center.dy)
+      ..lineTo(center.dx, center.dy + size / 2)
+      ..lineTo(center.dx - size / 2, center.dy)
+      ..close();
+    canvas.drawPath(path, paint);
+    // petit contour
+    final border = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2
+      ..color = Colors.black.withOpacity(0.6);
+    canvas.drawPath(path, border);
   }
 }
